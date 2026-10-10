@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use aws_lc_rs::aead::{Aad, Nonce, RandomizedNonceKey, AES_256_GCM, NONCE_LEN};
+use aws_lc_rs::constant_time::verify_slices_are_equal;
 use aws_lc_rs::digest::{digest, SHA256};
 use base64ct::{Base64, Encoding};
 use dragonfly_client_config::dfdaemon::{Config, KmsProvider};
@@ -25,6 +26,13 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::info;
 use zeroize::Zeroizing;
+
+#[cfg(feature = "aws-kms")]
+pub mod aws;
+pub mod azure;
+pub mod gcp;
+pub(crate) mod http;
+pub mod vault;
 
 /// The length of the data encryption key and the key encryption key in bytes
 /// (AES-256).
@@ -76,7 +84,7 @@ pub trait KeyProvider: Send + Sync {
 /// Creates the key provider of the configured key management service.
 pub async fn new_key_provider(config: &Config) -> Result<Arc<dyn KeyProvider>> {
     let kms = &config.storage.encryption.kms;
-    match kms.provider {
+    let provider: Arc<dyn KeyProvider> = match kms.provider {
         KmsProvider::File => {
             let key_file = kms.file.key_file.as_ref().ok_or_else(|| {
                 Error::Encryption(
@@ -85,15 +93,73 @@ pub async fn new_key_provider(config: &Config) -> Result<Arc<dyn KeyProvider>> {
                 )
             })?;
 
-            let provider = FileKeyProvider::new(key_file, &kms.file.previous_key_files).await?;
-            info!(
-                "encryption at rest enabled with the {} key provider, active key encryption key: {}",
-                provider.name(),
-                provider.active_key_id()
-            );
-            Ok(Arc::new(provider))
+            Arc::new(FileKeyProvider::new(key_file, &kms.file.previous_key_files).await?)
         }
+        #[cfg(feature = "aws-kms")]
+        KmsProvider::AwsKms => Arc::new(aws::AwsKmsKeyProvider::new(&kms.aws_kms).await?),
+        #[cfg(not(feature = "aws-kms"))]
+        KmsProvider::AwsKms => {
+            return Err(Error::Encryption(
+                "the awsKms key provider requires dfdaemon built with the aws-kms feature"
+                    .to_string(),
+            ))
+        }
+        KmsProvider::GcpKms => Arc::new(gcp::GcpKmsKeyProvider::new(&kms.gcp_kms).await?),
+        KmsProvider::AzureKeyVault => {
+            Arc::new(azure::AzureKeyVaultKeyProvider::new(&kms.azure_key_vault).await?)
+        }
+        KmsProvider::VaultTransit => {
+            Arc::new(vault::VaultTransitKeyProvider::new(&kms.vault_transit).await?)
+        }
+    };
+
+    info!(
+        "encryption at rest enabled with the {} key provider, active key encryption key: {}",
+        provider.name(),
+        provider.active_key_id()
+    );
+    Ok(provider)
+}
+
+/// Returns the SHA-256 digest of the wrapping context.
+pub(crate) fn context_digest(context: &[u8]) -> [u8; 32] {
+    let mut output = [0u8; 32];
+    output.copy_from_slice(digest(&SHA256, context).as_ref());
+    output
+}
+
+/// Returns the hex encoded SHA-256 digest of the wrapping context, for the
+/// providers taking the context as a string, e.g. an encryption context.
+pub(crate) fn context_digest_hex(context: &[u8]) -> String {
+    hex::encode(context_digest(context))
+}
+
+/// Binds the context to the data key for the providers without associated
+/// data: the plaintext to wrap is the data key followed by the digest of the
+/// context, which the wrapping authenticates together.
+pub(crate) fn bind_context(data_key: &DataKey, context: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(KEY_LEN + 32));
+    plaintext.extend_from_slice(data_key.as_ref());
+    plaintext.extend_from_slice(&context_digest(context));
+    plaintext
+}
+
+/// Returns the data key of the unwrapped plaintext of [`bind_context`],
+/// verifying the digest of the context in constant time.
+pub(crate) fn unbind_context(plaintext: &[u8], context: &[u8]) -> Result<DataKey> {
+    if plaintext.len() != KEY_LEN + 32 {
+        return Err(Error::Encryption(
+            "unwrapped data encryption key has an invalid length".to_string(),
+        ));
     }
+
+    verify_slices_are_equal(&plaintext[KEY_LEN..], &context_digest(context)).map_err(|_| {
+        Error::Encryption("unwrapped data encryption key does not match the context".to_string())
+    })?;
+
+    let mut data_key = DataKey::new([0u8; KEY_LEN]);
+    data_key.copy_from_slice(&plaintext[..KEY_LEN]);
+    Ok(data_key)
 }
 
 /// A key encryption key held in memory by the file provider.
@@ -375,6 +441,28 @@ mod tests {
         assert_eq!(out, [0x00, 0xff, 0xa5, 0xc3]);
         assert!(!decode_hex_ct(b"00ffA5", &mut out));
         assert!(!decode_hex_ct(b"00ffA5cz", &mut out));
+    }
+
+    #[test]
+    fn test_context_binding() {
+        let data_key = data_key(9);
+        let bound = bind_context(&data_key, b"context");
+        assert_eq!(bound.len(), KEY_LEN + 32);
+        assert_eq!(&bound[..KEY_LEN], data_key.as_ref());
+        assert_eq!(
+            hex::encode(&bound[KEY_LEN..]),
+            context_digest_hex(b"context")
+        );
+
+        assert_eq!(
+            unbind_context(&bound, b"context").unwrap().as_ref(),
+            data_key.as_ref()
+        );
+        assert!(unbind_context(&bound, b"other").is_err());
+        assert!(unbind_context(&bound[..KEY_LEN], b"context").is_err());
+        let mut tampered = bound.clone();
+        tampered[KEY_LEN + 3] ^= 1;
+        assert!(unbind_context(&tampered, b"context").is_err());
     }
 
     #[tokio::test]

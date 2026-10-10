@@ -372,3 +372,9 @@ assets = [
   { source = "../README.md", dest = "/usr/share/doc/client/README.md", mode = "644", doc = true },
 ]
 auto-req = "no"
+
+[features]
+default = []
+# Enables the `awsKms` key management service provider of the storage
+# encryption at rest.
+aws-kms = ["dragonfly-client-storage/aws-kms"]
