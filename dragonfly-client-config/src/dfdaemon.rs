@@ -1159,15 +1159,59 @@ fn validate_encryption(
         return Ok(());
     }
 
-    match encryption.kms.provider {
+    let kms = &encryption.kms;
+    let missing = |field: &'static str, message: &'static str| {
+        let mut err = validator::ValidationError::new(field);
+        err.message = Some(message.into());
+        err
+    };
+
+    match kms.provider {
         KmsProvider::File => {
-            if encryption.kms.file.key_file.is_none() {
-                let mut err = validator::ValidationError::new("key_file");
-                err.message = Some(
-                    "storage.encryption.kms.file.keyFile is required when encryption is enabled"
-                        .into(),
-                );
-                return Err(err);
+            if kms.file.key_file.is_none() {
+                return Err(missing(
+                    "key_file",
+                    "storage.encryption.kms.file.keyFile is required by the file provider",
+                ));
+            }
+        }
+        KmsProvider::AwsKms => {
+            if kms.aws_kms.key_id.is_none() {
+                return Err(missing(
+                    "key_id",
+                    "storage.encryption.kms.awsKms.keyId is required by the awsKms provider",
+                ));
+            }
+        }
+        KmsProvider::GcpKms => {
+            if kms.gcp_kms.key_name.is_none() {
+                return Err(missing(
+                    "key_name",
+                    "storage.encryption.kms.gcpKms.keyName is required by the gcpKms provider",
+                ));
+            }
+        }
+        KmsProvider::AzureKeyVault => {
+            if kms.azure_key_vault.vault_url.is_none() {
+                return Err(missing(
+                    "vault_url",
+                    "storage.encryption.kms.azureKeyVault.vaultUrl is required by the azureKeyVault provider",
+                ));
+            }
+
+            if kms.azure_key_vault.key_name.is_none() {
+                return Err(missing(
+                    "key_name",
+                    "storage.encryption.kms.azureKeyVault.keyName is required by the azureKeyVault provider",
+                ));
+            }
+        }
+        KmsProvider::VaultTransit => {
+            if kms.vault_transit.key_name.is_none() {
+                return Err(missing(
+                    "key_name",
+                    "storage.encryption.kms.vaultTransit.keyName is required by the vaultTransit provider",
+                ));
             }
         }
     }
@@ -1177,24 +1221,249 @@ fn validate_encryption(
 
 /// The key management service provider of the key encryption key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum KmsProvider {
     /// The key encryption key is loaded from a local file, e.g. a mounted
     /// Kubernetes secret or a file written by an external secret manager.
     #[default]
     File,
+
+    /// The data keys are wrapped by an AWS KMS key. Requires dfdaemon built
+    /// with the `aws-kms` feature.
+    AwsKms,
+
+    /// The data keys are wrapped by a Google Cloud KMS crypto key.
+    GcpKms,
+
+    /// The data keys are wrapped by an Azure Key Vault or Managed HSM key.
+    AzureKeyVault,
+
+    /// The data keys are wrapped by a HashiCorp Vault transit key.
+    VaultTransit,
 }
 
 /// The key management service configuration for the encryption at rest.
 #[derive(Debug, Clone, Default, Validate, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Kms {
-    /// The provider of the key encryption key, only `file` is supported now.
+    /// The provider of the key encryption key.
     pub provider: KmsProvider,
 
     /// The configuration of the `file` provider.
     #[validate]
     pub file: FileKms,
+
+    /// The configuration of the `awsKms` provider.
+    #[validate]
+    pub aws_kms: AwsKms,
+
+    /// The configuration of the `gcpKms` provider.
+    #[validate]
+    pub gcp_kms: GcpKms,
+
+    /// The configuration of the `azureKeyVault` provider.
+    #[validate]
+    pub azure_key_vault: AzureKeyVault,
+
+    /// The configuration of the `vaultTransit` provider.
+    #[validate]
+    pub vault_transit: VaultTransit,
+}
+
+/// The configuration of the `awsKms` key management service provider. The
+/// credentials come from the default AWS credential chain: the environment,
+/// the shared configuration files, the web identity token of an EKS service
+/// account (IRSA, Pod Identity) or the instance metadata.
+#[derive(Debug, Clone, Default, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AwsKms {
+    /// The id, ARN or alias (`alias/name`) of the symmetric KMS key wrapping the
+    /// data keys. The dfdaemon identity needs `kms:Encrypt` and `kms:Decrypt`
+    /// on it.
+    pub key_id: Option<String>,
+
+    /// The region of the key, defaults to the region of the environment.
+    pub region: Option<String>,
+
+    /// The endpoint URL overriding the regional KMS endpoint, e.g. a VPC
+    /// endpoint.
+    pub endpoint: Option<String>,
+}
+
+/// The configuration of the `gcpKms` key management service provider. The
+/// credentials come from the service account key file configured or named by
+/// `GOOGLE_APPLICATION_CREDENTIALS`, or from the metadata server of the
+/// instance or the GKE workload identity otherwise.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GcpKms {
+    /// The resource name of the symmetric crypto key wrapping the data keys:
+    /// `projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}`.
+    /// The dfdaemon identity needs the `cloudkms.cryptoKeyVersions.useToEncrypt`
+    /// and `useToDecrypt` permissions on it.
+    pub key_name: Option<String>,
+
+    /// The path of the service account key file.
+    pub credentials_file: Option<PathBuf>,
+
+    /// The endpoint of the Cloud KMS API.
+    #[serde(default = "default_gcp_kms_endpoint")]
+    pub endpoint: String,
+}
+
+/// Implement Default for GcpKms.
+impl Default for GcpKms {
+    fn default() -> Self {
+        Self {
+            key_name: None,
+            credentials_file: None,
+            endpoint: default_gcp_kms_endpoint(),
+        }
+    }
+}
+
+/// Returns the default endpoint of the Cloud KMS API.
+#[inline]
+fn default_gcp_kms_endpoint() -> String {
+    "https://cloudkms.googleapis.com".to_string()
+}
+
+/// The configuration of the `azureKeyVault` key management service provider.
+/// The credentials come from the workload identity (`AZURE_FEDERATED_TOKEN_FILE`),
+/// the client secret (`AZURE_CLIENT_SECRET`) or the managed identity of the
+/// virtual machine or the pod, like the Azure SDKs.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AzureKeyVault {
+    /// The URL of the key vault or the managed HSM, e.g.
+    /// `https://my-vault.vault.azure.net`.
+    pub vault_url: Option<String>,
+
+    /// The name of the key wrapping the data keys. The dfdaemon identity needs
+    /// the `wrapKey` and `unwrapKey` key permissions on it.
+    pub key_name: Option<String>,
+
+    /// The version of the key wrapping new data keys, defaults to the latest.
+    pub key_version: Option<String>,
+
+    /// The key wrapping algorithm: `RSA-OAEP-256` (default), `RSA-OAEP`,
+    /// `RSA1_5`, or `A128KW`, `A192KW`, `A256KW` for the symmetric keys of a
+    /// managed HSM.
+    #[serde(default = "default_azure_key_vault_algorithm")]
+    pub algorithm: String,
+
+    /// The authority host issuing the tokens, defaults to
+    /// `AZURE_AUTHORITY_HOST`, then `https://login.microsoftonline.com`. The
+    /// sovereign clouds use another host.
+    pub authority_host: Option<String>,
+
+    /// The tenant id of the identity, defaults to `AZURE_TENANT_ID`.
+    pub tenant_id: Option<String>,
+
+    /// The client id of the identity, defaults to `AZURE_CLIENT_ID`.
+    pub client_id: Option<String>,
+
+    /// The path of the file holding the client secret of the identity,
+    /// defaults to `AZURE_CLIENT_SECRET`.
+    pub client_secret_file: Option<PathBuf>,
+
+    /// The path of the federated token file of the workload identity, defaults
+    /// to `AZURE_FEDERATED_TOKEN_FILE`.
+    pub federated_token_file: Option<PathBuf>,
+}
+
+/// Implement Default for AzureKeyVault.
+impl Default for AzureKeyVault {
+    fn default() -> Self {
+        Self {
+            vault_url: None,
+            key_name: None,
+            key_version: None,
+            algorithm: default_azure_key_vault_algorithm(),
+            authority_host: None,
+            tenant_id: None,
+            client_id: None,
+            client_secret_file: None,
+            federated_token_file: None,
+        }
+    }
+}
+
+/// Returns the default key wrapping algorithm of Azure Key Vault.
+#[inline]
+fn default_azure_key_vault_algorithm() -> String {
+    "RSA-OAEP-256".to_string()
+}
+
+/// The configuration of the `vaultTransit` key management service provider.
+/// The token comes from the token file configured, from `VAULT_TOKEN`, or
+/// from the Kubernetes auth method with the service account token of the pod.
+#[derive(Debug, Clone, Validate, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VaultTransit {
+    /// The address of the Vault server, defaults to `VAULT_ADDR`.
+    pub address: Option<String>,
+
+    /// The namespace of the Vault enterprise server, defaults to
+    /// `VAULT_NAMESPACE`.
+    pub namespace: Option<String>,
+
+    /// The mount path of the transit secrets engine.
+    #[serde(default = "default_vault_transit_mount")]
+    pub mount: String,
+
+    /// The name of the transit key wrapping the data keys. The token needs the
+    /// `update` capability on its `encrypt` and `decrypt` paths.
+    pub key_name: Option<String>,
+
+    /// The path of the file holding the Vault token.
+    pub token_file: Option<PathBuf>,
+
+    /// The mount path of the Kubernetes auth method.
+    #[serde(default = "default_vault_kubernetes_auth_mount")]
+    pub kubernetes_auth_mount: String,
+
+    /// The role of the Kubernetes auth method; when set, dfdaemon logs in with
+    /// the service account token of the pod instead of a static token.
+    pub kubernetes_role: Option<String>,
+
+    /// The path of the service account token of the pod.
+    #[serde(default = "default_vault_kubernetes_jwt_file")]
+    pub kubernetes_jwt_file: PathBuf,
+}
+
+/// Implement Default for VaultTransit.
+impl Default for VaultTransit {
+    fn default() -> Self {
+        Self {
+            address: None,
+            namespace: None,
+            mount: default_vault_transit_mount(),
+            key_name: None,
+            token_file: None,
+            kubernetes_auth_mount: default_vault_kubernetes_auth_mount(),
+            kubernetes_role: None,
+            kubernetes_jwt_file: default_vault_kubernetes_jwt_file(),
+        }
+    }
+}
+
+/// Returns the default mount path of the transit secrets engine.
+#[inline]
+fn default_vault_transit_mount() -> String {
+    "transit".to_string()
+}
+
+/// Returns the default mount path of the Kubernetes auth method.
+#[inline]
+fn default_vault_kubernetes_auth_mount() -> String {
+    "kubernetes".to_string()
+}
+
+/// Returns the default path of the service account token of the pod.
+#[inline]
+fn default_vault_kubernetes_jwt_file() -> PathBuf {
+    PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/token")
 }
 
 /// The configuration of the `file` key management service provider.
@@ -3095,6 +3364,72 @@ mod tests {
         assert_eq!(storage.encryption.kms.provider, KmsProvider::File);
         assert!(storage.encryption.kms.file.key_file.is_none());
         assert!(storage.validate().is_ok());
+    }
+
+    #[test]
+    fn deserialize_storage_encryption_providers_correctly() {
+        let json_data = r#"
+        {
+            "encryption": {
+                "enable": true,
+                "kms": {
+                    "provider": "awsKms",
+                    "awsKms": { "keyId": "alias/dragonfly", "region": "us-east-1" },
+                    "gcpKms": { "keyName": "projects/p/locations/l/keyRings/r/cryptoKeys/k" },
+                    "azureKeyVault": { "vaultUrl": "https://v.vault.azure.net", "keyName": "k", "algorithm": "A256KW" },
+                    "vaultTransit": { "address": "https://vault:8200", "keyName": "k", "kubernetesRole": "dragonfly" }
+                }
+            }
+        }"#;
+
+        let storage: Storage = serde_json::from_str(json_data).unwrap();
+        let kms = &storage.encryption.kms;
+        assert_eq!(kms.provider, KmsProvider::AwsKms);
+        assert_eq!(kms.aws_kms.key_id.as_deref(), Some("alias/dragonfly"));
+        assert_eq!(kms.aws_kms.region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            kms.gcp_kms.key_name.as_deref(),
+            Some("projects/p/locations/l/keyRings/r/cryptoKeys/k")
+        );
+        assert_eq!(kms.gcp_kms.endpoint, "https://cloudkms.googleapis.com");
+        assert_eq!(kms.azure_key_vault.algorithm, "A256KW");
+        assert_eq!(kms.vault_transit.mount, "transit");
+        assert_eq!(kms.vault_transit.kubernetes_auth_mount, "kubernetes");
+        assert_eq!(
+            kms.vault_transit.kubernetes_role.as_deref(),
+            Some("dragonfly")
+        );
+        assert!(storage.validate().is_ok());
+
+        // Every provider requires its key.
+        let test_cases = vec![
+            (r#"{"provider": "awsKms"}"#, false),
+            (r#"{"provider": "awsKms", "awsKms": {"keyId": "k"}}"#, true),
+            (r#"{"provider": "gcpKms"}"#, false),
+            (
+                r#"{"provider": "gcpKms", "gcpKms": {"keyName": "k"}}"#,
+                true,
+            ),
+            (
+                r#"{"provider": "azureKeyVault", "azureKeyVault": {"keyName": "k"}}"#,
+                false,
+            ),
+            (
+                r#"{"provider": "azureKeyVault", "azureKeyVault": {"vaultUrl": "https://v", "keyName": "k"}}"#,
+                true,
+            ),
+            (r#"{"provider": "vaultTransit"}"#, false),
+            (
+                r#"{"provider": "vaultTransit", "vaultTransit": {"keyName": "k"}}"#,
+                true,
+            ),
+        ];
+
+        for (kms, expected_ok) in test_cases {
+            let json_data = format!(r#"{{"encryption": {{"enable": true, "kms": {kms}}}}}"#);
+            let storage: Storage = serde_json::from_str(&json_data).unwrap();
+            assert_eq!(storage.validate().is_ok(), expected_ok, "{kms}");
+        }
     }
 
     #[test]
