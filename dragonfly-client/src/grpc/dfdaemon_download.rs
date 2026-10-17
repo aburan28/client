@@ -42,7 +42,7 @@ use dragonfly_api::dfdaemon::v2::{
 use dragonfly_api::errordetails::v2::Backend;
 use dragonfly_api::scheduler::v2::DeleteHostRequest as SchedulerDeleteHostRequest;
 use dragonfly_client_backend::StatRequest;
-use dragonfly_client_config::dfdaemon::Config;
+use dragonfly_client_config::dfdaemon::{parse_unix_socket_mode, Config};
 use dragonfly_client_core::{
     error::{ErrorType, OrErr},
     Error as ClientError, Result as ClientResult,
@@ -62,6 +62,7 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_util::{
     digest::{is_blob_url, is_manifest_digest_url, verify_file_digest, Digest},
+    fs::access::Caller,
     http::{hashmap_to_headermap, headermap_to_hashmap, parse_range_header},
     id_generator::{
         repository_revision, PersistentCacheTaskIDParameter, PersistentTaskIDParameter,
@@ -84,6 +85,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Barrier;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::server::UdsConnectInfo;
 use tonic::{
     transport::{Channel, Endpoint, Server, Uri},
     Code, Request, Response, Status,
@@ -188,10 +190,27 @@ impl DfdaemonDownloadServer {
                 info!("remove {:?} failed: {}", self.socket_path, err);
             });
 
-        // Bind the unix domain socket and set the permissions for the socket.
+        // Bind the unix domain socket and restrict the permissions of the socket,
+        // since any process able to connect can drive dfdaemon.
         let uds = UnixListener::bind(&self.socket_path)?;
-        let perms = std::fs::Permissions::from_mode(0o777);
+        let socket_mode = parse_unix_socket_mode(&self.config.download.server.socket_mode)
+            .ok_or(ClientError::InvalidParameter)?;
+        if let Some(socket_group) = &self.config.download.server.socket_group {
+            let gid = resolve_group(socket_group)?;
+            rustix::fs::chown(
+                &self.socket_path,
+                None,
+                Some(rustix::fs::Gid::from_raw(gid)),
+            )
+            .map_err(std::io::Error::from)?;
+        }
+
+        let perms = std::fs::Permissions::from_mode(socket_mode);
         fs::set_permissions(&self.socket_path, perms).await?;
+        info!(
+            "download server socket {:?} has mode {:o}",
+            self.socket_path, socket_mode
+        );
 
         let uds_stream = UnixListenerStream::new(uds);
         let server = Server::builder()
@@ -271,6 +290,68 @@ pub struct DfdaemonDownloadServerHandler {
 }
 
 /// Dfdaemon download server handler implements the dfdaemon download grpc service.
+/// Returns the local caller of the request from the credentials of its unix
+/// socket connection.
+fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
+    request
+        .extensions()
+        .get::<UdsConnectInfo>()
+        .and_then(|info| info.peer_cred)
+        .map(|cred| Caller {
+            uid: cred.uid(),
+            gid: cred.gid(),
+        })
+        .ok_or_else(|| Status::permission_denied("unknown caller of the download server"))
+}
+
+/// Checks that the caller could write the output path itself, so dfdaemon does
+/// not write files on behalf of a caller that could not write them.
+fn check_output_path(caller: &Caller, output_path: Option<&str>) -> Result<(), Status> {
+    if let Some(output_path) = output_path {
+        caller
+            .check_writable(Path::new(output_path))
+            .map_err(|err| {
+                error!("refuse output path for uid {}: {}", caller.uid, err);
+                Status::permission_denied(format!("output path refused: {err}"))
+            })?;
+    }
+
+    Ok(())
+}
+
+/// Checks that the caller could read the path itself, so dfdaemon does not
+/// read and distribute files on behalf of a caller that could not read them.
+fn check_input_path(caller: &Caller, path: &str) -> Result<(), Status> {
+    caller.check_readable(Path::new(path)).map_err(|err| {
+        error!("refuse path for uid {}: {}", caller.uid, err);
+        Status::permission_denied(format!("path refused: {err}"))
+    })
+}
+
+/// Resolves a group name or a numeric group id to a group id, reading the
+/// group database of the host.
+fn resolve_group(group: &str) -> ClientResult<u32> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+
+    let content = std::fs::read_to_string("/etc/group")?;
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let gid = fields.nth(1)?.parse::<u32>().ok()?;
+            Some((name, gid))
+        })
+        .find(|(name, _)| *name == group)
+        .map(|(_, gid)| gid)
+        .ok_or_else(|| {
+            error!("group {} not found", group);
+            ClientError::InvalidParameter
+        })
+}
+
 #[async_trait::async_trait]
 impl DfdaemonDownload for DfdaemonDownloadServerHandler {
     /// Stream of download task responses.
@@ -294,6 +375,9 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         let start_time = Instant::now();
 
         // Clone the request.
+        // Identify the local caller before consuming the request.
+        let caller = caller(&request)?;
+
         let request = request.into_inner();
 
         // Check whether the download is empty.
@@ -301,6 +385,9 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
             error!("missing download");
             Status::invalid_argument("missing download")
         })?;
+
+        // Refuse to write an output path the caller could not write itself.
+        check_output_path(&caller, download.output_path.as_deref())?;
 
         // Check whether rejected by blocklist policy.
         let check_params = DownloadBlockListCheckParams {
@@ -1118,7 +1205,13 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         let start_time = Instant::now();
 
         // Clone the request.
+        // Identify the local caller before consuming the request.
+        let caller = caller(&request)?;
+
         let request = request.into_inner();
+
+        // Refuse to write an output path the caller could not write itself.
+        check_output_path(&caller, request.output_path.as_deref())?;
 
         // Check whether rejected by blocklist policy.
         let check_params = &DownloadBlockListCheckParams {
@@ -1441,7 +1534,13 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         let start_time = Instant::now();
 
         // Clone the request.
+        // Identify the local caller before consuming the request.
+        let caller = caller(&request)?;
+
         let request = request.into_inner();
+
+        // Refuse to read a path the caller could not read itself.
+        check_input_path(&caller, request.path.as_str())?;
 
         // Check whether rejected by blocklist policy.
         let check_params = &UploadBlockListCheckParams {
@@ -1721,7 +1820,13 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         let start_time = Instant::now();
 
         // Clone the request.
+        // Identify the local caller before consuming the request.
+        let caller = caller(&request)?;
+
         let request = request.into_inner();
+
+        // Refuse to write an output path the caller could not write itself.
+        check_output_path(&caller, request.output_path.as_deref())?;
 
         // Check whether rejected by blocklist policy.
         let check_params = &DownloadBlockListCheckParams {
@@ -1998,7 +2103,13 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         let start_time = Instant::now();
 
         // Clone the request.
+        // Identify the local caller before consuming the request.
+        let caller = caller(&request)?;
+
         let request = request.into_inner();
+
+        // Refuse to read a path the caller could not read itself.
+        check_input_path(&caller, request.path.as_str())?;
 
         // Check whether rejected by blocklist policy.
         let check_params = &UploadBlockListCheckParams {
@@ -2656,5 +2767,93 @@ impl DfdaemonDownloadClient {
         let mut request = tonic::Request::new(request);
         request.set_timeout(super::REQUEST_TIMEOUT);
         request
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+    use tonic_health::pb::{health_client::HealthClient, HealthCheckRequest};
+
+    #[tokio::test]
+    async fn unix_socket_requests_carry_the_caller_credentials() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("dfdaemon.sock");
+        let uds = UnixListener::bind(&socket_path).unwrap();
+
+        // Record the caller seen by a service behind the same rate limit layer
+        // as the download service.
+        let seen: Arc<Mutex<Option<Caller>>> = Arc::new(Mutex::new(None));
+        let seen_clone = seen.clone();
+        let (_reporter, health_service) = tonic_health::server::health_reporter();
+        let service = InterceptedService::new(health_service, move |request: Request<()>| {
+            *seen_clone.lock().unwrap() = Some(caller(&request)?);
+            Ok(request)
+        });
+
+        tokio::spawn(
+            Server::builder()
+                .add_service(rate_limit(service, 100, 100, None))
+                .serve_with_incoming(UnixListenerStream::new(uds)),
+        );
+
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .unwrap()
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let socket_path = socket_path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(socket_path).await?))
+                }
+            }))
+            .await
+            .unwrap();
+        HealthClient::new(channel)
+            .check(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let caller = seen.lock().unwrap().expect("caller is recorded");
+        assert_eq!(caller.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(caller.gid, rustix::process::getegid().as_raw());
+        assert!(caller.is_privileged());
+    }
+
+    #[test]
+    fn output_and_input_paths_are_checked_for_the_caller() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let other = Caller {
+            uid: 65_000,
+            gid: 65_000,
+        };
+        assert!(check_output_path(&other, None).is_ok());
+        assert_eq!(
+            check_output_path(&other, file.to_str()).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            check_input_path(&other, file.to_str().unwrap())
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let root = Caller { uid: 0, gid: 0 };
+        assert!(check_output_path(&root, file.to_str()).is_ok());
+        assert!(check_input_path(&root, file.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn groups_resolve_by_name_or_id() {
+        assert_eq!(resolve_group("42").unwrap(), 42);
+        assert_eq!(resolve_group("root").unwrap(), 0);
+        assert!(resolve_group("no-such-group-dragonfly").is_err());
     }
 }

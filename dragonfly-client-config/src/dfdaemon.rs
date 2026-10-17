@@ -69,6 +69,29 @@ pub fn default_download_unix_socket_path() -> PathBuf {
     crate::default_root_dir().join("dfdaemon.sock")
 }
 
+/// Returns the default permission bits of the unix socket of the download server.
+#[inline]
+fn default_download_unix_socket_mode() -> String {
+    "0660".to_string()
+}
+
+/// Parses the permission bits of a unix socket from an octal string.
+pub fn parse_unix_socket_mode(mode: &str) -> Option<u32> {
+    let mode = u32::from_str_radix(mode.trim().trim_start_matches("0o"), 8).ok()?;
+    (mode <= 0o777).then_some(mode)
+}
+
+/// Validates the permission bits of the unix socket of the download server.
+fn validate_unix_socket_mode(mode: &str) -> std::result::Result<(), validator::ValidationError> {
+    if parse_unix_socket_mode(mode).is_none() {
+        let mut err = validator::ValidationError::new("socket_mode");
+        err.message = Some("download.server.socketMode must be an octal mode up to 0777".into());
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 /// Returns the default protocol of downloading.
 #[inline]
 fn default_download_protocol() -> String {
@@ -468,6 +491,21 @@ pub struct DownloadServer {
     #[serde(default = "default_download_unix_socket_path")]
     pub socket_path: PathBuf,
 
+    /// The permission bits of the unix socket, as an octal string. Any local
+    /// process able to connect to the socket can drive dfdaemon, so the default
+    /// `0660` restricts it to the owner and the `socketGroup`. Set `0666` to let
+    /// every local user download through dfdaemon; dfdaemon still refuses to
+    /// write an output path or read an upload path that the calling user could
+    /// not write or read itself.
+    #[serde(default = "default_download_unix_socket_mode")]
+    #[validate(custom = "validate_unix_socket_mode")]
+    pub socket_mode: String,
+
+    /// The group owning the unix socket, as a group name or a numeric group id,
+    /// whose members can connect to the socket with the default `socketMode`.
+    /// Defaults to the group of the dfdaemon process.
+    pub socket_group: Option<String>,
+
     /// The rate limit for the requests on the download gRPC server.
     ///
     /// This limit applies to the total number of gRPC requests per second,
@@ -494,6 +532,8 @@ impl Default for DownloadServer {
     fn default() -> Self {
         DownloadServer {
             socket_path: default_download_unix_socket_path(),
+            socket_mode: default_download_unix_socket_mode(),
+            socket_group: None,
             request_rate_limit: default_download_request_rate_limit(),
             request_buffer_size: default_download_request_buffer_size(),
         }
@@ -505,6 +545,7 @@ impl Default for DownloadServer {
 #[serde(default, rename_all = "camelCase")]
 pub struct Download {
     /// The download server configuration for dfdaemon.
+    #[validate]
     pub server: DownloadServer,
 
     /// The protocol that peers use to download piece (e.g., "tcp", "quic").
@@ -1931,6 +1972,25 @@ mod tests {
         (ca_cert, cert, key)
     }
 
+    #[test]
+    fn download_socket_mode_defaults_to_owner_and_group() {
+        let server = DownloadServer::default();
+        assert_eq!(server.socket_mode, "0660");
+        assert!(server.socket_group.is_none());
+        assert!(server.validate().is_ok());
+
+        assert_eq!(parse_unix_socket_mode("0660"), Some(0o660));
+        assert_eq!(parse_unix_socket_mode("666"), Some(0o666));
+        assert_eq!(parse_unix_socket_mode("0o600"), Some(0o600));
+        assert_eq!(parse_unix_socket_mode("0778"), None);
+        assert_eq!(parse_unix_socket_mode("1777"), None);
+        assert_eq!(parse_unix_socket_mode("rw"), None);
+
+        let server: DownloadServer =
+            serde_json::from_str(r#"{"socketMode": "0999", "socketGroup": "dragonfly"}"#).unwrap();
+        assert!(server.validate().is_err());
+        assert_eq!(server.socket_group.as_deref(), Some("dragonfly"));
+    }
     #[test]
     fn host_deserializes_fields() {
         let json = r#"{
