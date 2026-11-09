@@ -65,7 +65,8 @@ storage:
   encryption:
     enable: true
     kms:
-      # The provider of the key encryption key, only `file` is supported now.
+      # The provider of the key encryption key: file, awsKms, gcpKms,
+      # azureKeyVault or vaultTransit, see below.
       provider: file
       file:
         # The active key encryption key: 32 raw bytes, 64 hex characters or
@@ -77,7 +78,132 @@ storage:
           - /etc/dragonfly/kek-old.key
 ```
 
-A key encryption key is generated with, for example:
+### Key management services
+
+The `kms.provider` selects where the key encryption key lives. The `file`
+provider above keeps it on the node. The cloud providers below wrap the data
+keys with a key that never leaves the service, so a node holds no key
+encryption key at all, and every wrap and unwrap is audited by the service.
+The wrapping context (the identity of the file and its layout parameters)
+is bound through the encryption context or additional authenticated data of
+the service, or by a digest wrapped together with the data key for the
+services without one.
+
+A data key is wrapped once per task and unwrapped once per task per dfdaemon
+start (or after the task's cipher is evicted), so the request volume to the
+service is low, in the order of the task creations.
+
+**AWS KMS** (`awsKms`, requires dfdaemon built with `--features aws-kms`):
+
+```yaml
+storage:
+  encryption:
+    enable: true
+    kms:
+      provider: awsKms
+      awsKms:
+        # The id, ARN or alias of a symmetric KMS key.
+        keyId: alias/dragonfly
+        # Optional, defaults to the region of the environment.
+        region: us-east-1
+        # Optional, e.g. a VPC endpoint.
+        endpoint: https://vpce-xxx.kms.us-east-1.vpce.amazonaws.com
+```
+
+The credentials come from the default credential chain: the environment,
+the shared configuration, the web identity of an EKS service account (IRSA
+or Pod Identity) or the instance metadata. The identity needs `kms:Encrypt`
+and `kms:Decrypt` on the key. The context is bound as the encryption context
+`dragonfly:context`, which appears in CloudTrail.
+
+**Google Cloud KMS** (`gcpKms`):
+
+```yaml
+storage:
+  encryption:
+    enable: true
+    kms:
+      provider: gcpKms
+      gcpKms:
+        keyName: projects/my-project/locations/global/keyRings/dragonfly/cryptoKeys/content
+        # Optional, defaults to GOOGLE_APPLICATION_CREDENTIALS, then the
+        # metadata server (GCE, GKE workload identity).
+        credentialsFile: /etc/dragonfly/gcp-sa.json
+```
+
+The identity needs the `cloudkms.cryptoKeyVersions.useToEncrypt` and
+`useToDecrypt` permissions on the key (the Cloud KMS CryptoKey
+Encrypter/Decrypter role). The context is bound as the additional
+authenticated data.
+
+**Azure Key Vault and Managed HSM** (`azureKeyVault`):
+
+```yaml
+storage:
+  encryption:
+    enable: true
+    kms:
+      provider: azureKeyVault
+      azureKeyVault:
+        vaultUrl: https://my-vault.vault.azure.net
+        keyName: dragonfly
+        # Optional, defaults to the latest version for new tasks.
+        keyVersion: ""
+        # RSA-OAEP-256 (default), RSA-OAEP, RSA1_5, or A128KW, A192KW,
+        # A256KW for the symmetric keys of a managed HSM.
+        algorithm: RSA-OAEP-256
+        # Optional, default to AZURE_AUTHORITY_HOST, AZURE_TENANT_ID,
+        # AZURE_CLIENT_ID, AZURE_CLIENT_SECRET and AZURE_FEDERATED_TOKEN_FILE.
+        authorityHost: https://login.microsoftonline.com
+        tenantId: ""
+        clientId: ""
+        clientSecretFile: ""
+        federatedTokenFile: ""
+```
+
+The credentials come, in this order, from the workload identity (a
+federated token file, as injected by the AKS workload identity webhook),
+the client secret, or the managed identity of the virtual machine or the
+pod. The identity needs the `wrapKey` and `unwrapKey` key permissions. The
+service has no associated data for key wrapping, so the digest of the
+context is wrapped together with the data key and verified on unwrap.
+
+**HashiCorp Vault transit** (`vaultTransit`):
+
+```yaml
+storage:
+  encryption:
+    enable: true
+    kms:
+      provider: vaultTransit
+      vaultTransit:
+        # Optional, defaults to VAULT_ADDR.
+        address: https://vault.example.com:8200
+        # Optional, defaults to VAULT_NAMESPACE.
+        namespace: ""
+        mount: transit
+        keyName: dragonfly
+        # A static token, or the Kubernetes auth method with the service
+        # account token of the pod. Defaults to VAULT_TOKEN.
+        tokenFile: ""
+        kubernetesAuthMount: kubernetes
+        kubernetesRole: dragonfly
+        kubernetesJwtFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+The token needs the `update` capability on `transit/encrypt/dragonfly` and
+`transit/decrypt/dragonfly`. Like for Azure, the digest of the context is
+wrapped together with the data key. The Vault key versions are handled by
+Vault: after `vault write -f transit/keys/dragonfly/rotate`, new tasks use
+the new version and the old ones stay readable until `min_decryption_version`
+excludes their version.
+
+With every cloud provider, the file header of a task names the key version
+that wrapped its data key, but the unwrap always goes to the configured key
+of the configured service, so a header edited on disk cannot redirect the
+credentials or the request to another key or another endpoint.
+
+A key encryption key for the `file` provider is generated with, for example:
 
 ```shell
 head -c 32 /dev/urandom | base64 > /etc/dragonfly/kek.key
