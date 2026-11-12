@@ -51,7 +51,6 @@ use vortex_protocol::{
     Header, Message, HEADER_SIZE,
 };
 
-#[cfg(not(target_os = "linux"))]
 use tokio::io::copy_buf;
 
 /// A TCP-based server for dfdaemon upload service.
@@ -712,7 +711,9 @@ impl TCPServerHandler {
 
     /// Streams the remaining range of the piece file directly to the TCP
     /// socket with sendfile, so the piece bytes move from the page cache to
-    /// the socket inside the kernel without passing through user space.
+    /// the socket inside the kernel without passing through user space. The
+    /// content encrypted on disk cannot be sent from the file descriptor, so
+    /// its reader is copied through user space instead, decrypting it.
     #[cfg(target_os = "linux")]
     #[instrument(skip_all)]
     async fn write_stream(
@@ -721,12 +722,25 @@ impl TCPServerHandler {
         writer: &mut OwnedWriteHalf,
     ) -> ClientResult<()> {
         debug!("start to write stream to tcp writer");
-        let (fd, offset, remaining) = reader.into_parts();
-        let sent = sendfile_range(writer.as_ref(), &fd, offset, remaining)
-            .await
-            .inspect_err(|err| {
-                error!("sendfile failed: {}", err);
-            })?;
+        let (sent, remaining) = match reader.into_parts() {
+            Ok((fd, offset, remaining)) => (
+                sendfile_range(writer.as_ref(), &fd, offset, remaining)
+                    .await
+                    .inspect_err(|err| {
+                        error!("sendfile failed: {}", err);
+                    })?,
+                remaining,
+            ),
+            Err(mut reader) => {
+                let remaining = reader.remaining();
+                (
+                    copy_buf(&mut reader, writer).await.inspect_err(|err| {
+                        error!("copy failed: {}", err);
+                    })?,
+                    remaining,
+                )
+            }
+        };
 
         if sent != remaining {
             return Err(ClientError::Unknown(format!(
@@ -802,7 +816,9 @@ async fn sendfile_range(
         match stream.try_io(tokio::io::Interest::WRITABLE, || {
             let mut off = offset;
             let count = remaining.min(MAX_SENDFILE_COUNT) as usize;
-            rustix::fs::sendfile(stream, fd, Some(&mut off), count)
+
+            // Hand off the worker, since sendfile waits on disk for the pages not in the page cache.
+            tokio::task::block_in_place(|| rustix::fs::sendfile(stream, fd, Some(&mut off), count))
                 .map(|n| n as u64)
                 .map_err(std::io::Error::from)
         }) {
@@ -861,7 +877,7 @@ mod tests {
         (sender, receiver)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sendfile_range_sends_the_range_until_eof() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("task");
@@ -896,7 +912,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sendfile_range_fails_when_the_peer_closed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("task");
@@ -911,7 +927,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn handle_serves_the_requests_on_the_connection_until_the_client_closes_it() {
         let temp_dir = tempfile::tempdir().unwrap();
         let handler = handler(temp_dir.path()).await;
@@ -934,6 +950,7 @@ mod tests {
                 TASK_ID,
                 0,
                 CONTENT.len() as u64,
+                false,
                 &mut stream,
                 Duration::from_secs(5),
             )
@@ -965,7 +982,7 @@ mod tests {
         assert!(server.await.unwrap().is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_fails_on_a_short_send() {
         let temp_dir = tempfile::tempdir().unwrap();
         let handler = handler(temp_dir.path()).await;
