@@ -17,6 +17,8 @@
 use bytes::{Bytes, BytesMut};
 use dragonfly_client_core::{Error, Result};
 use dragonfly_client_util::buffer_pool::BufferPool;
+use dragonfly_client_util::digest::{Algorithm, Hasher};
+use dragonfly_client_util::fs::fd::WriteFD;
 use futures::{Stream, TryStreamExt};
 use std::cmp::{max, min};
 use std::fs::File;
@@ -27,6 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// The response of writing a range.
@@ -34,7 +37,10 @@ pub struct WriteRangeResponse {
     /// The length of the written range.
     pub length: u64,
 
-    /// The CRC32 hash of the written range.
+    /// The algorithm of the hash of the written range.
+    pub algorithm: Algorithm,
+
+    /// The encoded hash of the written range.
     pub hash: String,
 }
 
@@ -245,19 +251,20 @@ impl AsyncRead for RangeReader {
 }
 
 /// Writes exactly `expected_length` bytes from the reader to the file with
-/// positional writes starting at `offset`, and calculates the CRC32 hash of
-/// the written content. The reader fills one buffer on the runtime and hashes
+/// positional writes starting at `offset`, and calculates the hash of the
+/// written content with `algorithm`. The reader fills one buffer on the runtime and hashes
 /// it while the data is still hot in the cache of the filling core, then
-/// hands it to the blocking thread pool for the positional write, swapping
-/// the recycled buffer of the completed write back for the next fill instead
-/// of copying, so the read and the hash overlap the write.
+/// queues it on the file descriptor for the positional write, swapping the
+/// recycled buffer of the completed write back for the next fill instead of
+/// copying, so the read and the hash overlap the write.
 pub async fn write_range<R: AsyncRead + Unpin + ?Sized>(
-    fd: Arc<File>,
+    fd: &WriteFD,
     mut offset: u64,
     expected_length: u64,
     buffer_size: usize,
     reader: &mut R,
     buffer_pool: &BufferPool,
+    algorithm: Algorithm,
 ) -> Result<WriteRangeResponse> {
     let buffer_size = max(buffer_size, 1);
     let mut reader = reader.take(expected_length);
@@ -267,11 +274,11 @@ pub async fn write_range<R: AsyncRead + Unpin + ?Sized>(
     // from the buffer pool and returned to it at the end.
     let mut buffer = buffer_pool.checkout(buffer_size);
 
-    // The in-flight write on the blocking thread pool, owning the other
+    // The in-flight write queued on the file descriptor, owning the other
     // buffer until it completes.
-    let mut in_flight: Option<JoinHandle<io::Result<BytesMut>>> = None;
+    let mut in_flight: Option<oneshot::Receiver<io::Result<BytesMut>>> = None;
 
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = Hasher::new(algorithm);
     let mut length: u64 = 0;
     loop {
         // Fill the buffer until it is full or the reader reaches EOF.
@@ -291,29 +298,28 @@ pub async fn write_range<R: AsyncRead + Unpin + ?Sized>(
 
         // Wait for the previous write to take back its buffer.
         let recycled = match in_flight.take() {
-            Some(handle) => handle.await.map_err(io::Error::other)??,
+            Some(rx) => rx.await.map_err(io::Error::other)??,
             None => buffer_pool.checkout(buffer_size),
         };
 
         let filled = std::mem::replace(&mut buffer, recycled);
         length += filled.len() as u64;
 
-        let fd = fd.clone();
         let filled_offset = offset;
         offset += filled.len() as u64;
-        in_flight = Some(tokio::task::spawn_blocking(move || {
+        in_flight = Some(fd.spawn_blocking(move |fd| {
             fd.write_all_at(&filled, filled_offset)?;
 
             let mut recycled = filled;
             recycled.clear();
             Ok(recycled)
-        }));
+        })?);
     }
 
     // Wait for the last write to complete and return the staging buffers to
     // the pool.
-    if let Some(handle) = in_flight.take() {
-        buffer_pool.give_back(handle.await.map_err(io::Error::other)??);
+    if let Some(rx) = in_flight.take() {
+        buffer_pool.give_back(rx.await.map_err(io::Error::other)??);
     }
     buffer_pool.give_back(buffer);
 
@@ -325,7 +331,8 @@ pub async fn write_range<R: AsyncRead + Unpin + ?Sized>(
 
     Ok(WriteRangeResponse {
         length,
-        hash: hasher.finalize().to_string(),
+        algorithm,
+        hash: hasher.finalize(),
     })
 }
 
@@ -383,19 +390,20 @@ fn write_all_vectored_at(fd: &File, chunks: &[Bytes], mut offset: u64) -> io::Re
 
 /// Writes exactly `expected_length` bytes from the stream of bytes chunks to
 /// the file with positional writes starting at `offset`, and calculates the
-/// CRC32 hash of the written content. Each chunk is hashed on the runtime
+/// hash of the written content with `algorithm`. Each chunk is hashed on the runtime
 /// while its data is still hot in the cache of the polling core and staged
-/// without copying, then the staged chunks are handed to the blocking thread
-/// pool for a vectored positional write once they hold `buffer_size` bytes,
-/// swapping the emptied vector of the completed write back for the next
-/// batch, so the receive and the hash overlap the write and the chunks are
-/// dropped off the runtime.
+/// without copying, then the staged chunks are queued on the file descriptor
+/// for a vectored positional write once they reach a `buffer_size` boundary
+/// of the file, swapping the emptied vector of the completed write back for
+/// the next batch, so the receive and the hash overlap the write and the
+/// chunks are dropped off the runtime.
 pub async fn write_range_from_stream<S>(
-    fd: Arc<File>,
+    fd: &WriteFD,
     mut offset: u64,
     expected_length: u64,
     buffer_size: usize,
     stream: &mut S,
+    algorithm: Algorithm,
 ) -> Result<WriteRangeResponse>
 where
     S: Stream<Item = io::Result<Bytes>> + Unpin + ?Sized,
@@ -407,16 +415,26 @@ where
     let mut batch: Vec<Bytes> = Vec::new();
     let mut batch_size: usize = 0;
 
-    // The in-flight write on the blocking thread pool, owning the staged
+    // The in-flight write queued on the file descriptor, owning the staged
     // chunks until it completes.
-    let mut in_flight: Option<JoinHandle<io::Result<Vec<Bytes>>>> = None;
-    let mut hasher = crc32fast::Hasher::new();
+    let mut in_flight: Option<oneshot::Receiver<io::Result<Vec<Bytes>>>> = None;
+    let mut hasher = Hasher::new(algorithm);
     let mut length: u64 = 0;
     let mut eof = false;
+
+    // The rest of the chunk split off the previous batch.
+    let mut rest: Option<Bytes> = None;
     loop {
-        // Stage the chunks until they hold buffer_size bytes, the expected
-        // length is reached or the stream ends.
-        while !eof && batch_size < buffer_size && length < expected_length {
+        // Start the batch with the rest.
+        if let Some(chunk) = rest.take() {
+            batch_size += chunk.len();
+            batch.push(chunk);
+        }
+
+        // Stage the chunks until they reach a buffer_size boundary of the
+        // file, the expected length is reached or the stream ends.
+        let aligned_size = buffer_size - (offset % buffer_size as u64) as usize;
+        while !eof && batch_size < aligned_size && length < expected_length {
             match stream.try_next().await? {
                 Some(mut chunk) => {
                     if chunk.is_empty() {
@@ -441,13 +459,23 @@ where
             }
         }
 
+        // Split the last chunk at the last boundary, so the write does not end
+        // inside a large folio.
+        let rest_size = ((offset + batch_size as u64) % buffer_size as u64) as usize;
+        if batch_size > aligned_size && rest_size > 0 {
+            if let Some(chunk) = batch.last_mut() {
+                rest = Some(chunk.split_off(chunk.len() - rest_size));
+                batch_size -= rest_size;
+            }
+        }
+
         if batch.is_empty() {
             break;
         }
 
         // Wait for the previous write to take back its vector.
         let recycled = match in_flight.take() {
-            Some(handle) => handle.await.map_err(io::Error::other)??,
+            Some(rx) => rx.await.map_err(io::Error::other)??,
             None => Vec::new(),
         };
 
@@ -456,21 +484,20 @@ where
         offset += batch_size as u64;
         batch_size = 0;
 
-        let fd = fd.clone();
-        in_flight = Some(tokio::task::spawn_blocking(move || {
+        in_flight = Some(fd.spawn_blocking(move |fd| {
             let mut chunks = filled;
-            write_all_vectored_at(&fd, &chunks, filled_offset)?;
+            write_all_vectored_at(fd, &chunks, filled_offset)?;
 
             // Drop the chunks on the blocking thread and hand the emptied
             // vector back for the next batch.
             chunks.clear();
             Ok(chunks)
-        }));
+        })?);
     }
 
     // Wait for the last write to complete.
-    if let Some(handle) = in_flight.take() {
-        handle.await.map_err(io::Error::other)??;
+    if let Some(rx) = in_flight.take() {
+        rx.await.map_err(io::Error::other)??;
     }
 
     if length != expected_length {
@@ -481,7 +508,8 @@ where
 
     Ok(WriteRangeResponse {
         length,
-        hash: hasher.finalize().to_string(),
+        algorithm,
+        hash: hasher.finalize(),
     })
 }
 
@@ -770,12 +798,13 @@ mod tests {
 
         let data: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
         write_range(
-            cache.open_write(&path).await.unwrap(),
+            &cache.open_write(&path).await.unwrap(),
             0,
             data.len() as u64,
             4 * 1024,
             &mut data.as_slice(),
             &BufferPool::new(64 * 1024 * 1024),
+            Algorithm::Crc32,
         )
         .await
         .unwrap();
@@ -814,12 +843,13 @@ mod tests {
                 .await
                 .unwrap();
             let response = write_range(
-                open_rw(&path),
+                &WriteFD::new(open_rw(&path)),
                 offset,
                 expected_length,
                 buffer_size,
                 &mut data.as_slice(),
                 &BufferPool::new(64 * 1024 * 1024),
+                Algorithm::Crc32,
             )
             .await
             .unwrap();
@@ -840,17 +870,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let path = temp_dir.path().join("task");
         tokio::fs::write(&path, b"").await.unwrap();
-        let fd = open_rw(&path);
-        let read_only_fd = Arc::new(File::open(&path).unwrap());
+        let fd = WriteFD::new(open_rw(&path));
+        let read_only_fd = WriteFD::new(Arc::new(File::open(&path).unwrap()));
         let data: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
 
-        let test_cases: Vec<(
-            Arc<File>,
-            u64,
-            usize,
-            Vec<io::Result<Bytes>>,
-            fn(Result<u64>),
-        )> = vec![
+        let test_cases: Vec<(WriteFD, u64, usize, Vec<io::Result<Bytes>>, fn(Result<u64>))> = vec![
             (
                 fd.clone(),
                 2048,
@@ -911,12 +935,13 @@ mod tests {
         for (fd, expected_length, buffer_size, chunks, expect) in test_cases {
             let mut reader = StreamReader::new(futures::stream::iter(chunks));
             let result = write_range(
-                fd,
+                &fd,
                 0,
                 expected_length,
                 buffer_size,
                 &mut reader,
                 &BufferPool::new(64 * 1024 * 1024),
+                Algorithm::Crc32,
             )
             .await;
             expect(result.map(|response| response.length));
@@ -938,6 +963,8 @@ mod tests {
             (0, 13, 0, 3),
             (0, 0, 512, 5),
             (0, 512, 512, 100),
+            (3, 40, 8, 40),
+            (3, 30, 8, 40),
             (
                 0,
                 2 * MAX_WRITE_IOVECS + 500,
@@ -956,11 +983,12 @@ mod tests {
                 .collect();
             let mut stream = futures::stream::iter(chunks);
             let response = write_range_from_stream(
-                open_rw(&path),
+                &WriteFD::new(open_rw(&path)),
                 offset,
                 expected_length,
                 buffer_size,
                 &mut stream,
+                Algorithm::Crc32,
             )
             .await
             .unwrap();
@@ -989,10 +1017,17 @@ mod tests {
             Ok(Bytes::new()),
             Ok(Bytes::from_static(b", world!")),
         ]);
-        let response =
-            write_range_from_stream(open_rw(&path), 0, data.len() as u64, 512, &mut stream)
-                .await
-                .unwrap();
+        let fd = WriteFD::new(open_rw(&path));
+        let response = write_range_from_stream(
+            &fd,
+            0,
+            data.len() as u64,
+            512,
+            &mut stream,
+            Algorithm::Crc32,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.length, data.len() as u64);
         assert_eq!(response.hash, crc32fast::hash(data).to_string());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), data);
@@ -1003,17 +1038,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let path = temp_dir.path().join("task");
         tokio::fs::write(&path, b"").await.unwrap();
-        let fd = open_rw(&path);
-        let read_only_fd = Arc::new(File::open(&path).unwrap());
+        let fd = WriteFD::new(open_rw(&path));
+        let read_only_fd = WriteFD::new(Arc::new(File::open(&path).unwrap()));
         let data: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
 
-        let test_cases: Vec<(
-            Arc<File>,
-            u64,
-            usize,
-            Vec<io::Result<Bytes>>,
-            fn(Result<u64>),
-        )> = vec![
+        let test_cases: Vec<(WriteFD, u64, usize, Vec<io::Result<Bytes>>, fn(Result<u64>))> = vec![
             (
                 fd.clone(),
                 2048,
@@ -1051,6 +1080,15 @@ mod tests {
                 },
             ),
             (
+                fd.clone(),
+                10,
+                4,
+                vec![Ok(Bytes::from_static(b"hello"))],
+                |result| {
+                    assert!(matches!(result, Err(Error::Unknown(_))));
+                },
+            ),
+            (
                 read_only_fd.clone(),
                 16 * 1024,
                 4,
@@ -1073,8 +1111,15 @@ mod tests {
 
         for (fd, expected_length, buffer_size, chunks, expect) in test_cases {
             let mut stream = futures::stream::iter(chunks);
-            let result =
-                write_range_from_stream(fd, 0, expected_length, buffer_size, &mut stream).await;
+            let result = write_range_from_stream(
+                &fd,
+                0,
+                expected_length,
+                buffer_size,
+                &mut stream,
+                Algorithm::Crc32,
+            )
+            .await;
             expect(result.map(|response| response.length));
         }
     }
@@ -1087,7 +1132,7 @@ mod tests {
         tokio::fs::write(&path, vec![0u8; data.len()])
             .await
             .unwrap();
-        let fd = open_rw(&path);
+        let fd = WriteFD::new(open_rw(&path));
 
         let range_length: usize = 8 * 1024;
         let handles: Vec<_> = (0..8usize)
@@ -1096,12 +1141,13 @@ mod tests {
                 let piece = data[i * range_length..(i + 1) * range_length].to_vec();
                 tokio::spawn(async move {
                     write_range(
-                        fd,
+                        &fd,
                         (i * range_length) as u64,
                         piece.len() as u64,
                         1024,
                         &mut piece.as_slice(),
                         &BufferPool::new(64 * 1024 * 1024),
+                        Algorithm::Crc32,
                     )
                     .await
                     .unwrap();

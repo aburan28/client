@@ -16,10 +16,10 @@
 
 use bytes::{Bytes, BytesMut};
 use chrono::NaiveDateTime;
-use dragonfly_api::common::v2::Range;
-use dragonfly_client_config::dfdaemon::Config;
+use dragonfly_api::common::v2::{Image, Range};
+use dragonfly_client_config::dfdaemon::{Config, PieceDigestAlgorithm};
 use dragonfly_client_core::{Error, Result};
-use dragonfly_client_util::digest::{Algorithm, Digest};
+use dragonfly_client_util::digest::{Algorithm, Digest, Hasher};
 use futures::Stream;
 use page_cache::PageCache;
 use piece_notifier::{Claim, PieceNotifier};
@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::{
     fs,
     io::{AsyncBufRead, AsyncRead, AsyncReadExt},
-    sync::Notify,
+    sync::{Mutex, Notify},
     time::sleep,
 };
 use tokio_util::io::InspectReader;
@@ -88,6 +88,10 @@ pub struct Storage {
 
     /// Drops the written pieces from the page cache under memory pressure.
     page_cache: Arc<PageCache>,
+
+    /// Mutex guarding the concurrent creation of the tasks by image and deletion of
+    /// the images.
+    mutex: Mutex<()>,
 }
 
 /// Implements the storage.
@@ -107,6 +111,7 @@ impl Storage {
             cache,
             piece_notifier: PieceNotifier::default(),
             page_cache: PageCache::new(),
+            mutex: Mutex::new(()),
         })
     }
 
@@ -220,6 +225,10 @@ impl Storage {
             .delete_task(id)
             .unwrap_or_else(|err| error!("delete task metadata failed: {}", err));
 
+        self.metadata
+            .delete_images_by_task(id)
+            .unwrap_or_else(|err| error!("delete images by task metadatas failed: {}", err));
+
         self.metadata.delete_pieces(id).unwrap_or_else(|err| {
             error!("delete piece metadatas failed: {}", err);
         });
@@ -232,6 +241,104 @@ impl Storage {
         cache.delete_task(id).await.unwrap_or_else(|err| {
             info!("delete task from cache failed: {}", err);
         });
+    }
+
+    /// Creates the metadata of the task referenced by the platform of the image.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn create_task_by_image(
+        &self,
+        image_id: &str,
+        task_id: &str,
+        image: &Image,
+    ) -> Result<metadata::TaskByImage> {
+        let _guard = self.mutex.lock().await;
+        self.metadata.create_task_by_image(
+            image_id,
+            image.platform.as_deref().unwrap_or_default(),
+            task_id,
+            &image.reference,
+        )
+    }
+
+    /// Deletes the tasks of the platform of the image which are not referenced by other
+    /// images or platforms, and returns the deleted task ids and the retained task ids.
+    /// All the platforms of the image are deleted if the platform is none.
+    #[instrument(skip_all)]
+    pub async fn delete_image(
+        &self,
+        image_id: &str,
+        platform: Option<&str>,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let _guard = self.mutex.lock().await;
+        let tasks = self.metadata.get_tasks_by_image(image_id, platform)?;
+        let mut task_ids = tasks
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect::<Vec<String>>();
+        task_ids.sort();
+        task_ids.dedup();
+
+        let mut deleted_task_ids = Vec::new();
+        let mut retained_task_ids = Vec::new();
+        for task_id in task_ids {
+            let images = self.metadata.get_images_by_task(&task_id)?;
+            let referenced = images.iter().any(|image| {
+                image.image_id != image_id
+                    || platform.is_some_and(|platform| image.platform != platform)
+            });
+
+            let task = self.metadata.get_task(&task_id)?;
+            if !referenced {
+                match &task {
+                    Some(task) if !task.need_evict() => {
+                        retained_task_ids.push(task_id);
+                        continue;
+                    }
+                    Some(_) => {
+                        self.delete_task(&task_id).await;
+                        deleted_task_ids.push(task_id);
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+
+            // Delete the tasks by image, because the task is retained by other references
+            // or does not exist.
+            for image in images {
+                if image.image_id == image_id
+                    && platform.is_none_or(|platform| image.platform == platform)
+                {
+                    self.metadata
+                        .delete_task_by_image(image_id, &image.platform, &task_id)?;
+                }
+            }
+
+            if task.is_some() {
+                retained_task_ids.push(task_id);
+            }
+        }
+
+        Ok((deleted_task_ids, retained_task_ids))
+    }
+
+    /// Returns the metadatas of the tasks referenced by all the images.
+    #[instrument(level = "debug", skip_all)]
+    pub fn get_all_tasks_by_image(&self) -> Result<Vec<metadata::TaskByImage>> {
+        self.metadata.get_all_tasks_by_image()
+    }
+
+    /// Deletes the metadata of the task referenced by the platform of the image.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn delete_task_by_image(
+        &self,
+        image_id: &str,
+        platform: &str,
+        task_id: &str,
+    ) -> Result<()> {
+        let _guard = self.mutex.lock().await;
+        self.metadata
+            .delete_task_by_image(image_id, platform, task_id)
     }
 
     /// Hard links the persistent task content to the destination.
@@ -668,9 +775,15 @@ impl Storage {
     ) -> Result<metadata::Piece> {
         let response = self
             .content
-            .write_persistent_piece(task_id, offset, length, reader)
+            .write_persistent_piece(
+                task_id,
+                offset,
+                length,
+                reader,
+                self.piece_digest_algorithm(),
+            )
             .await?;
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
 
         self.metadata.create_persistent_piece(
             piece_id,
@@ -715,9 +828,15 @@ impl Storage {
     ) -> Result<metadata::Piece> {
         let response = self
             .content
-            .write_persistent_cache_piece(task_id, offset, length, reader)
+            .write_persistent_cache_piece(
+                task_id,
+                offset,
+                length,
+                reader,
+                self.piece_digest_algorithm(),
+            )
             .await?;
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
 
         self.metadata.create_persistent_cache_piece(
             piece_id,
@@ -810,6 +929,7 @@ impl Storage {
         task_id: &str,
         offset: u64,
         length: u64,
+        is_prefetch: bool,
         stream: &mut S,
         timeout: Duration,
     ) -> Result<metadata::Piece>
@@ -817,7 +937,7 @@ impl Storage {
         S: Stream<Item = std::io::Result<Bytes>> + Unpin + ?Sized,
     {
         let piece = tokio::select! {
-            piece = self.handle_downloaded_from_source_finished(piece_id, task_id, offset, length, stream) => {
+            piece = self.handle_downloaded_from_source_finished(piece_id, task_id, offset, length, is_prefetch, stream) => {
                 piece
             }
             _ = sleep(timeout) => {
@@ -843,6 +963,7 @@ impl Storage {
         task_id: &str,
         offset: u64,
         length: u64,
+        is_prefetch: bool,
         stream: &mut S,
     ) -> Result<metadata::Piece>
     where
@@ -850,10 +971,17 @@ impl Storage {
     {
         let response = self
             .content
-            .write_piece_from_stream(task_id, offset, length, stream)
+            .write_piece_from_stream(
+                task_id,
+                offset,
+                length,
+                is_prefetch,
+                stream,
+                self.piece_digest_algorithm(),
+            )
             .await?;
 
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
         self.metadata.download_piece_finished(
             piece_id,
             offset,
@@ -874,6 +1002,7 @@ impl Storage {
         length: u64,
         expected_digest: &str,
         parent_id: &str,
+        is_prefetch: bool,
         stream: &mut S,
         timeout: Duration,
     ) -> Result<metadata::Piece>
@@ -881,7 +1010,7 @@ impl Storage {
         S: Stream<Item = std::io::Result<Bytes>> + Unpin + ?Sized,
     {
         let piece = tokio::select! {
-            piece = self.handle_downloaded_piece_from_parent_finished(piece_id, task_id, offset, length, expected_digest, parent_id, stream) => {
+            piece = self.handle_downloaded_piece_from_parent_finished(piece_id, task_id, offset, length, expected_digest, parent_id, is_prefetch, stream) => {
                 piece
             }
             _ = sleep(timeout) => {
@@ -910,18 +1039,20 @@ impl Storage {
         length: u64,
         expected_digest: &str,
         parent_id: &str,
+        is_prefetch: bool,
         stream: &mut S,
     ) -> Result<metadata::Piece>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Unpin + ?Sized,
     {
+        let algorithm = self.parent_piece_digest_algorithm(expected_digest)?;
         let response = self
             .content
-            .write_piece_from_stream(task_id, offset, length, stream)
+            .write_piece_from_stream(task_id, offset, length, is_prefetch, stream, algorithm)
             .await?;
 
         let length = response.length;
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
 
         // Check the digest of the piece.
         if expected_digest.is_empty() {
@@ -943,6 +1074,40 @@ impl Storage {
             digest.to_string().as_str(),
             Some(parent_id.to_string()),
         )
+    }
+
+    /// Returns the algorithm of the digests calculated for the pieces written
+    /// from the source or from local files.
+    fn piece_digest_algorithm(&self) -> Algorithm {
+        match self.config.storage.piece_digest_algorithm {
+            PieceDigestAlgorithm::Crc32 => Algorithm::Crc32,
+            PieceDigestAlgorithm::Sha256 => Algorithm::Sha256,
+        }
+    }
+
+    /// Returns the algorithm to verify a piece downloaded from a parent with,
+    /// which is the algorithm of the digest announced by the parent, so nodes
+    /// calculating different piece digests interoperate. When SHA-256 piece
+    /// digests are configured, a CRC32 digest announced by the parent is
+    /// rejected instead of downgrading the verification.
+    fn parent_piece_digest_algorithm(&self, expected_digest: &str) -> Result<Algorithm> {
+        if expected_digest.is_empty() {
+            return Ok(self.piece_digest_algorithm());
+        }
+
+        let expected_digest: Digest = expected_digest
+            .parse()
+            .map_err(|err: String| Error::DigestMismatch(expected_digest.to_string(), err))?;
+
+        let algorithm = expected_digest.algorithm();
+        if algorithm == Algorithm::Crc32 && self.piece_digest_algorithm() != Algorithm::Crc32 {
+            return Err(Error::DigestMismatch(
+                expected_digest.to_string(),
+                format!("{} piece digest required", self.piece_digest_algorithm()),
+            ));
+        }
+
+        Ok(algorithm)
     }
 
     /// Updates the metadata of the piece when the piece downloads failed.
@@ -1093,13 +1258,14 @@ impl Storage {
     where
         S: Stream<Item = std::io::Result<Bytes>> + Unpin + ?Sized,
     {
+        let algorithm = self.parent_piece_digest_algorithm(expected_digest)?;
         let response = self
             .content
-            .write_persistent_piece_from_stream(task_id, offset, length, stream)
+            .write_persistent_piece_from_stream(task_id, offset, length, stream, algorithm)
             .await?;
 
         let length = response.length;
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
 
         // Check the digest of the piece.
         if expected_digest.is_empty() {
@@ -1181,10 +1347,16 @@ impl Storage {
     {
         let response = self
             .content
-            .write_persistent_piece_from_stream(task_id, offset, length, stream)
+            .write_persistent_piece_from_stream(
+                task_id,
+                offset,
+                length,
+                stream,
+                self.piece_digest_algorithm(),
+            )
             .await?;
 
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
         self.metadata.download_piece_finished(
             piece_id,
             offset,
@@ -1333,13 +1505,14 @@ impl Storage {
     where
         S: Stream<Item = std::io::Result<Bytes>> + Unpin + ?Sized,
     {
+        let algorithm = self.parent_piece_digest_algorithm(expected_digest)?;
         let response = self
             .content
-            .write_persistent_cache_piece_from_stream(task_id, offset, length, stream)
+            .write_persistent_cache_piece_from_stream(task_id, offset, length, stream, algorithm)
             .await?;
 
         let length = response.length;
-        let digest = Digest::new(Algorithm::Crc32, response.hash);
+        let digest = Digest::new(response.algorithm, response.hash);
 
         // Check the digest of the piece.
         if expected_digest.is_empty() {
@@ -1444,7 +1617,7 @@ impl Storage {
 
     /// Waits for the piece to be finished.
     #[instrument(skip_all)]
-    async fn wait_for_piece_finished(&self, piece_id: &str) -> Result<metadata::Piece> {
+    pub async fn wait_for_piece_finished(&self, piece_id: &str) -> Result<metadata::Piece> {
         let piece = self
             .get_piece(piece_id)?
             .ok_or_else(|| Error::PieceNotFound(piece_id.to_string()))?;
@@ -1522,7 +1695,10 @@ impl Storage {
 
     /// Waits for the persistent piece to be finished.
     #[instrument(skip_all)]
-    async fn wait_for_persistent_piece_finished(&self, piece_id: &str) -> Result<metadata::Piece> {
+    pub async fn wait_for_persistent_piece_finished(
+        &self,
+        piece_id: &str,
+    ) -> Result<metadata::Piece> {
         let piece = self
             .get_persistent_piece(piece_id)?
             .ok_or_else(|| Error::PieceNotFound(piece_id.to_string()))?;
@@ -1766,7 +1942,7 @@ impl Storage {
         length: u64,
         reader: &mut R,
     ) -> Result<metadata::Piece> {
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = Hasher::new(self.piece_digest_algorithm());
         let mut content = BytesMut::with_capacity(length as usize);
         let mut tee = InspectReader::new(reader, |bytes| {
             hasher.update(bytes);
@@ -1779,8 +1955,7 @@ impl Storage {
             .write_piece(task_id, piece_id, content.freeze())
             .await?;
 
-        let hash = hasher.finalize().to_string();
-        let digest = Digest::new(Algorithm::Crc32, hash);
+        let digest = Digest::new(hasher.algorithm(), hasher.finalize());
         self.metadata.download_piece_finished(
             piece_id,
             offset,
@@ -1830,7 +2005,7 @@ impl Storage {
         parent_id: &str,
         reader: &mut R,
     ) -> Result<metadata::Piece> {
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = Hasher::new(self.parent_piece_digest_algorithm(expected_digest)?);
         let mut content = BytesMut::with_capacity(length as usize);
         let mut tee = InspectReader::new(reader, |bytes| {
             hasher.update(bytes);
@@ -1839,12 +2014,7 @@ impl Storage {
         // Keep reading until EOF to avoid truncating the piece content.
         while tee.read_buf(&mut content).await? > 0 {}
 
-        self.cache
-            .write_piece(task_id, piece_id, content.freeze())
-            .await?;
-
-        let hash = hasher.finalize().to_string();
-        let digest = Digest::new(Algorithm::Crc32, hash);
+        let digest = Digest::new(hasher.algorithm(), hasher.finalize());
 
         // Check the digest of the piece.
         if expected_digest.is_empty() {
@@ -1858,6 +2028,12 @@ impl Storage {
                 digest.to_string(),
             ));
         }
+
+        // Cache the piece only after its digest is verified, so a corrupted
+        // piece is never served from the cache.
+        self.cache
+            .write_piece(task_id, piece_id, content.freeze())
+            .await?;
 
         self.metadata.download_piece_finished(
             piece_id,
@@ -2024,10 +2200,21 @@ mod tests {
     const TASK_ID: &str = "d3add1f66b0d0b8083f14479d6e181ec9e2b34cf07d4a1a2ee2fcf51d3a3f14a";
     const CONTENT: &[u8] = b"piece content";
     const CONTENT_DIGEST: &str = "crc32:2533597436";
+    const CONTENT_SHA256_DIGEST: &str =
+        "sha256:0f2592159700536c81cd58094265e92089ebabb3e06f802c5f2d6e8e753cb233";
 
     async fn storage(dir: &Path) -> Arc<Storage> {
+        storage_with_piece_digest_algorithm(dir, PieceDigestAlgorithm::Crc32).await
+    }
+
+    async fn storage_with_piece_digest_algorithm(
+        dir: &Path,
+        piece_digest_algorithm: PieceDigestAlgorithm,
+    ) -> Arc<Storage> {
+        let mut config = Config::default();
+        config.storage.piece_digest_algorithm = piece_digest_algorithm;
         Arc::new(
-            Storage::new(Arc::new(Config::default()), dir, dir.to_path_buf())
+            Storage::new(Arc::new(config), dir, dir.to_path_buf())
                 .await
                 .unwrap(),
         )
@@ -2071,6 +2258,7 @@ mod tests {
                 TASK_ID,
                 0,
                 CONTENT.len() as u64,
+                false,
                 &mut stream,
                 Duration::from_secs(5),
             )
@@ -2150,6 +2338,7 @@ mod tests {
                         TASK_ID,
                         0,
                         CONTENT.len() as u64,
+                        false,
                         &mut stream,
                         Duration::from_secs(5),
                     )
@@ -2274,6 +2463,7 @@ mod tests {
                 TASK_ID,
                 0,
                 CONTENT.len() as u64,
+                false,
                 &mut stream,
                 Duration::from_secs(5),
             )
@@ -2339,12 +2529,142 @@ mod tests {
                     CONTENT.len() as u64,
                     expected_digest,
                     "parent-1",
+                    false,
                     &mut stream,
                     Duration::from_secs(5),
                 )
                 .await;
             let stored = storage.get_piece(piece_id.as_str()).unwrap();
             expect(result, stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_piece_from_parent_finished_follows_the_parent_digest_algorithm() {
+        let test_cases: Vec<(
+            PieceDigestAlgorithm,
+            &str,
+            fn(Result<metadata::Piece>, Option<metadata::Piece>),
+        )> = vec![
+            // A node calculating CRC32 digests verifies SHA-256 digests of
+            // upgraded parents.
+            (
+                PieceDigestAlgorithm::Crc32,
+                CONTENT_SHA256_DIGEST,
+                |result, _| {
+                    assert_eq!(result.unwrap().digest, CONTENT_SHA256_DIGEST);
+                },
+            ),
+            (
+                PieceDigestAlgorithm::Sha256,
+                CONTENT_SHA256_DIGEST,
+                |result, _| {
+                    assert_eq!(result.unwrap().digest, CONTENT_SHA256_DIGEST);
+                },
+            ),
+            // The digest of a piece without announced digest is calculated
+            // with the configured algorithm.
+            (PieceDigestAlgorithm::Sha256, "", |result, _| {
+                assert_eq!(result.unwrap().digest, CONTENT_SHA256_DIGEST);
+            }),
+            // A CRC32 digest is rejected when SHA-256 digests are configured,
+            // even if it matches.
+            (
+                PieceDigestAlgorithm::Sha256,
+                CONTENT_DIGEST,
+                |result, stored| {
+                    assert!(matches!(
+                        result,
+                        Err(Error::DigestMismatch(ref expected, _)) if expected == CONTENT_DIGEST
+                    ));
+                    assert!(!stored.unwrap().is_finished());
+                },
+            ),
+            (
+                PieceDigestAlgorithm::Sha256,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                |result, stored| {
+                    assert!(matches!(
+                        result,
+                        Err(Error::DigestMismatch(_, ref actual)) if actual == CONTENT_SHA256_DIGEST
+                    ));
+                    assert!(!stored.unwrap().is_finished());
+                },
+            ),
+            (PieceDigestAlgorithm::Crc32, "md5:1", |result, stored| {
+                assert!(matches!(result, Err(Error::DigestMismatch(..))));
+                assert!(!stored.unwrap().is_finished());
+            }),
+        ];
+
+        for (piece_digest_algorithm, expected_digest, expect) in test_cases {
+            let dir = tempdir().unwrap();
+            let storage =
+                storage_with_piece_digest_algorithm(dir.path(), piece_digest_algorithm).await;
+            storage
+                .download_task_started(TASK_ID, CONTENT.len() as u64, CONTENT.len() as u64, None)
+                .await
+                .unwrap();
+
+            let piece_id = storage.piece_id(TASK_ID, 0);
+            storage
+                .download_piece_started(piece_id.as_str(), 0, 0, CONTENT.len() as u64)
+                .await
+                .unwrap();
+            let mut stream = futures::stream::iter([Ok(Bytes::from_static(CONTENT))]);
+            let result = storage
+                .download_piece_from_parent_finished(
+                    piece_id.as_str(),
+                    TASK_ID,
+                    0,
+                    CONTENT.len() as u64,
+                    expected_digest,
+                    "parent-1",
+                    false,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await;
+            let stored = storage.get_piece(piece_id.as_str()).unwrap();
+            expect(result, stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_piece_from_source_finished_uses_the_configured_algorithm() {
+        let test_cases = vec![
+            (PieceDigestAlgorithm::Crc32, CONTENT_DIGEST),
+            (PieceDigestAlgorithm::Sha256, CONTENT_SHA256_DIGEST),
+        ];
+
+        for (piece_digest_algorithm, expected_digest) in test_cases {
+            let dir = tempdir().unwrap();
+            let storage =
+                storage_with_piece_digest_algorithm(dir.path(), piece_digest_algorithm).await;
+            storage
+                .download_task_started(TASK_ID, CONTENT.len() as u64, CONTENT.len() as u64, None)
+                .await
+                .unwrap();
+
+            let piece_id = storage.piece_id(TASK_ID, 0);
+            storage
+                .download_piece_started(piece_id.as_str(), 0, 0, CONTENT.len() as u64)
+                .await
+                .unwrap();
+            let mut stream = futures::stream::iter([Ok(Bytes::from_static(CONTENT))]);
+            let piece = storage
+                .download_piece_from_source_finished(
+                    piece_id.as_str(),
+                    TASK_ID,
+                    0,
+                    CONTENT.len() as u64,
+                    false,
+                    &mut stream,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(piece.digest, expected_digest);
         }
     }
 
@@ -2370,6 +2690,7 @@ mod tests {
                 TASK_ID,
                 0,
                 1024,
+                false,
                 &mut stream,
                 Duration::from_millis(50),
             )
@@ -2382,5 +2703,272 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_finished());
+    }
+
+    const IMAGE_ID: &str = "1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b";
+    const OTHER_IMAGE_ID: &str = "6f5e4d3c2b1a6f5e4d3c2b1a6f5e4d3c2b1a6f5e4d3c2b1a6f5e4d3c2b1a6f5e";
+
+    #[tokio::test]
+    async fn delete_image_deletes_only_the_tasks_not_referenced_by_other_images() {
+        let test_cases: Vec<(
+            Option<bool>,
+            Vec<(&str, Option<&str>)>,
+            Option<&str>,
+            fn(&Storage, Vec<String>, Vec<String>),
+        )> = vec![
+            (
+                Some(true),
+                vec![(IMAGE_ID, Some("linux/amd64"))],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert_eq!(deleted_task_ids, vec![TASK_ID]);
+                    assert!(retained_task_ids.is_empty());
+                    assert!(storage.get_task(TASK_ID).unwrap().is_none());
+                    assert!(storage
+                        .metadata
+                        .get_images_by_task(TASK_ID)
+                        .unwrap()
+                        .is_empty());
+                },
+            ),
+            (
+                Some(true),
+                vec![
+                    (IMAGE_ID, Some("linux/amd64")),
+                    (IMAGE_ID, Some("linux/arm64")),
+                ],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert_eq!(deleted_task_ids, vec![TASK_ID]);
+                    assert!(retained_task_ids.is_empty());
+                    assert!(storage.get_task(TASK_ID).unwrap().is_none());
+                    assert!(storage
+                        .metadata
+                        .get_images_by_task(TASK_ID)
+                        .unwrap()
+                        .is_empty());
+                },
+            ),
+            (
+                Some(true),
+                vec![
+                    (IMAGE_ID, Some("linux/amd64")),
+                    (IMAGE_ID, Some("linux/arm64")),
+                ],
+                Some("linux/amd64"),
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert!(deleted_task_ids.is_empty());
+                    assert_eq!(retained_task_ids, vec![TASK_ID]);
+                    assert!(storage.get_task(TASK_ID).unwrap().is_some());
+                    assert_eq!(
+                        storage
+                            .metadata
+                            .get_tasks_by_image(IMAGE_ID, Some("linux/arm64"))
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                },
+            ),
+            (
+                Some(true),
+                vec![
+                    (IMAGE_ID, Some("linux/amd64")),
+                    (OTHER_IMAGE_ID, Some("linux/amd64")),
+                ],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert!(deleted_task_ids.is_empty());
+                    assert_eq!(retained_task_ids, vec![TASK_ID]);
+                    assert!(storage.get_task(TASK_ID).unwrap().is_some());
+                    assert!(storage
+                        .metadata
+                        .get_tasks_by_image(IMAGE_ID, None)
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(
+                        storage
+                            .metadata
+                            .get_tasks_by_image(OTHER_IMAGE_ID, None)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                },
+            ),
+            (
+                Some(false),
+                vec![(IMAGE_ID, Some("linux/amd64"))],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert!(deleted_task_ids.is_empty());
+                    assert_eq!(retained_task_ids, vec![TASK_ID]);
+                    assert!(storage.get_task(TASK_ID).unwrap().is_some());
+                    assert_eq!(
+                        storage
+                            .metadata
+                            .get_tasks_by_image(IMAGE_ID, None)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                },
+            ),
+            (
+                Some(true),
+                vec![(IMAGE_ID, None)],
+                Some("linux/amd64"),
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert!(deleted_task_ids.is_empty());
+                    assert!(retained_task_ids.is_empty());
+                    assert!(storage.get_task(TASK_ID).unwrap().is_some());
+                    assert_eq!(
+                        storage
+                            .metadata
+                            .get_tasks_by_image(IMAGE_ID, None)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                },
+            ),
+            (
+                Some(true),
+                vec![(IMAGE_ID, None)],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert_eq!(deleted_task_ids, vec![TASK_ID]);
+                    assert!(retained_task_ids.is_empty());
+                    assert!(storage.get_task(TASK_ID).unwrap().is_none());
+                },
+            ),
+            (
+                None,
+                vec![(IMAGE_ID, Some("linux/amd64"))],
+                None,
+                |storage, deleted_task_ids, retained_task_ids| {
+                    assert!(deleted_task_ids.is_empty());
+                    assert!(retained_task_ids.is_empty());
+                    assert!(storage
+                        .metadata
+                        .get_tasks_by_image(IMAGE_ID, None)
+                        .unwrap()
+                        .is_empty());
+                    assert!(storage
+                        .metadata
+                        .get_images_by_task(TASK_ID)
+                        .unwrap()
+                        .is_empty());
+                },
+            ),
+        ];
+
+        for (finished, images, platform, expect) in test_cases {
+            let dir = tempdir().unwrap();
+            let storage = storage(dir.path()).await;
+            if let Some(finished) = finished {
+                storage
+                    .download_task_started(
+                        TASK_ID,
+                        CONTENT.len() as u64,
+                        CONTENT.len() as u64,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+
+                if finished {
+                    storage.download_task_finished(TASK_ID).unwrap();
+                }
+            }
+
+            for (image_id, image_platform) in images {
+                storage
+                    .create_task_by_image(
+                        image_id,
+                        TASK_ID,
+                        &Image {
+                            reference: "docker.io/library/nginx:latest".to_string(),
+                            platform: image_platform.map(|platform| platform.to_string()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let (deleted_task_ids, retained_task_ids) =
+                storage.delete_image(IMAGE_ID, platform).await.unwrap();
+            expect(&storage, deleted_task_ids, retained_task_ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_task_deletes_the_images_by_task() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+        let image = Image {
+            reference: "docker.io/library/nginx:latest".to_string(),
+            platform: Some("linux/amd64".to_string()),
+        };
+        storage
+            .download_task_started(TASK_ID, CONTENT.len() as u64, CONTENT.len() as u64, None)
+            .await
+            .unwrap();
+        storage
+            .create_task_by_image(IMAGE_ID, TASK_ID, &image)
+            .await
+            .unwrap();
+        storage
+            .create_task_by_image(OTHER_IMAGE_ID, TASK_ID, &image)
+            .await
+            .unwrap();
+
+        storage.delete_task(TASK_ID).await;
+        assert!(storage
+            .metadata
+            .get_images_by_task(TASK_ID)
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .metadata
+            .get_tasks_by_image(IMAGE_ID, None)
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .metadata
+            .get_tasks_by_image(OTHER_IMAGE_ID, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_task_by_image_after_delete_image_downloads_the_task_again() {
+        let dir = tempdir().unwrap();
+        let storage = storage(dir.path()).await;
+        let image = Image {
+            reference: "docker.io/library/nginx:latest".to_string(),
+            platform: Some("linux/amd64".to_string()),
+        };
+        storage
+            .download_task_started(TASK_ID, CONTENT.len() as u64, CONTENT.len() as u64, None)
+            .await
+            .unwrap();
+        storage.download_task_finished(TASK_ID).unwrap();
+        storage
+            .create_task_by_image(IMAGE_ID, TASK_ID, &image)
+            .await
+            .unwrap();
+
+        storage.delete_image(IMAGE_ID, None).await.unwrap();
+        storage
+            .create_task_by_image(OTHER_IMAGE_ID, TASK_ID, &image)
+            .await
+            .unwrap();
+        let (_, reused) = storage.prepare_download_task(TASK_ID).unwrap();
+        assert!(!reused);
+        assert_eq!(
+            storage.metadata.get_images_by_task(TASK_ID).unwrap().len(),
+            1
+        );
     }
 }

@@ -41,13 +41,20 @@ pub fn is_blob_url(url: &str) -> bool {
 
 /// Regex pattern for OCI manifest URLs, e.g. http(s)://<registry>/v2/<repository>/manifests/<reference>.
 static MANIFEST_URL_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.*)://(.*)/v2/(.*)/manifests/([^?]+)(?:\?.*)?$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(.*)://(.*?)/v2/(.*)/manifests/([^?]+)(?:\?.*)?$").unwrap());
 
-/// Checks if the URL is an OCI manifest URL whose reference is a digest with a
-/// supported algorithm. A manifest URL referenced by a tag returns false, so it
-/// falls back to the url based task id.
+/// Regex pattern for OCI manifest URLs referenced by a digest, e.g.
+/// http(s)://<registry>/v2/<repository>/manifests/<digest>.
+static MANIFEST_DIGEST_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(.*)://(.*)/v2/(.*)/manifests/(crc32:[^?]+|sha256:[^?]{64}|sha512:[^?]{128})(?:\?.*)?$",
+    )
+    .unwrap()
+});
+
+/// Checks if the URL is an OCI manifest digest URL.
 pub fn is_manifest_digest_url(url: &str) -> bool {
-    Digest::extract_from_manifest_url(url).is_some()
+    MANIFEST_DIGEST_URL_REGEX.is_match(url)
 }
 
 /// Algorithm for generating digests.
@@ -116,9 +123,20 @@ impl Digest {
             .ok()
     }
 
-    /// Extracts the digest from an OCI manifest URL, e.g. http(s)://<registry>/v2/<repository>/manifests/<digest>.
-    pub fn extract_from_manifest_url(url: &str) -> Option<Self> {
-        MANIFEST_URL_REGEX
+    /// Extracts the registry, the repository and the reference from an OCI manifest URL, e.g.
+    /// http(s)://<registry>/v2/<repository>/manifests/<reference>.
+    pub fn extract_from_manifest_url(url: &str) -> Option<(&str, &str, &str)> {
+        let captures = MANIFEST_URL_REGEX.captures(url)?;
+        Some((
+            captures.get(2)?.as_str(),
+            captures.get(3)?.as_str(),
+            captures.get(4)?.as_str(),
+        ))
+    }
+
+    /// Extracts the digest from an OCI manifest digest URL, e.g. http(s)://<registry>/v2/<repository>/manifests/<digest>.
+    pub fn extract_from_manifest_digest_url(url: &str) -> Option<Self> {
+        MANIFEST_DIGEST_URL_REGEX
             .captures(url)
             .and_then(|caps| caps.get(4))
             .map(|m| m.as_str())?
@@ -191,6 +209,59 @@ impl FromStr for Digest {
     }
 }
 
+/// Hasher calculates the digest of a stream of data with an algorithm chosen
+/// at runtime.
+pub enum Hasher {
+    /// CRC32 hasher.
+    Crc32(crc32fast::Hasher),
+
+    /// SHA-256 hasher.
+    Sha256(sha2::Sha256),
+
+    /// SHA-512 hasher.
+    Sha512(sha2::Sha512),
+}
+
+/// Implements the Hasher.
+impl Hasher {
+    /// Creates a new hasher for the algorithm.
+    pub fn new(algorithm: Algorithm) -> Self {
+        match algorithm {
+            Algorithm::Crc32 => Hasher::Crc32(crc32fast::Hasher::new()),
+            Algorithm::Sha256 => Hasher::Sha256(sha2::Sha256::new()),
+            Algorithm::Sha512 => Hasher::Sha512(sha2::Sha512::new()),
+        }
+    }
+
+    /// Returns the algorithm of the hasher.
+    pub fn algorithm(&self) -> Algorithm {
+        match self {
+            Hasher::Crc32(_) => Algorithm::Crc32,
+            Hasher::Sha256(_) => Algorithm::Sha256,
+            Hasher::Sha512(_) => Algorithm::Sha512,
+        }
+    }
+
+    /// Feeds the data into the hasher.
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Hasher::Crc32(hasher) => hasher.update(data),
+            Hasher::Sha256(hasher) => Sha2Digest::update(hasher, data),
+            Hasher::Sha512(hasher) => Sha2Digest::update(hasher, data),
+        }
+    }
+
+    /// Returns the encoded digest of the data fed into the hasher, in the
+    /// same encoding as calculate_file_digest.
+    pub fn finalize(self) -> String {
+        match self {
+            Hasher::Crc32(hasher) => hasher.finalize().to_string(),
+            Hasher::Sha256(hasher) => hex::encode(hasher.finalize()),
+            Hasher::Sha512(hasher) => hex::encode(hasher.finalize()),
+        }
+    }
+}
+
 /// Calculates the digest of a file.
 #[instrument(level = "debug", skip_all)]
 pub fn calculate_file_digest(algorithm: Algorithm, path: &Path) -> ClientResult<Digest> {
@@ -249,6 +320,24 @@ mod tests {
 
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn hasher_matches_calculate_file_digest() {
+        let data = b"Hello, world!";
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, data).unwrap();
+
+        for algorithm in [Algorithm::Crc32, Algorithm::Sha256, Algorithm::Sha512] {
+            // Feed the data in uneven chunks.
+            let mut hasher = Hasher::new(algorithm);
+            assert_eq!(hasher.algorithm(), algorithm);
+            hasher.update(&data[..3]);
+            hasher.update(&data[3..]);
+
+            let expected = calculate_file_digest(algorithm, file.path()).unwrap();
+            assert_eq!(hasher.finalize(), expected.encoded());
+        }
+    }
 
     #[test]
     fn is_blob_url_matches_oci_blob_urls() {
@@ -370,6 +459,50 @@ mod tests {
     }
 
     #[test]
+    fn extract_from_manifest_url_parses_oci_manifest_urls() {
+        let test_cases = vec![
+            (
+                "https://index.docker.io/v2/library/nginx/manifests/latest",
+                Some(("index.docker.io", "library/nginx", "latest")),
+            ),
+            (
+                "http://localhost:5000/v2/myrepo/manifests/1.0?ns=docker.io",
+                Some(("localhost:5000", "myrepo", "1.0")),
+            ),
+            (
+                "https://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+                Some((
+                    "registry.example.com",
+                    "library/ubuntu",
+                    "sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
+                )),
+            ),
+            (
+                "https://art.example.com/artifactory/api/docker/remote/v2/library/nginx/manifests/latest",
+                Some((
+                    "art.example.com/artifactory/api/docker/remote",
+                    "library/nginx",
+                    "latest",
+                )),
+            ),
+            (
+                "https://ghcr.io/v2/org/v2/app/manifests/1.0",
+                Some(("ghcr.io", "org/v2/app", "1.0")),
+            ),
+            (
+                "http://registry.example.com/v2/library/ubuntu/blobs/sha256:abc",
+                None,
+            ),
+            ("https://example.com/file.txt", None),
+            ("not-a-url", None),
+        ];
+
+        for (url, expected) in test_cases {
+            assert_eq!(Digest::extract_from_manifest_url(url), expected);
+        }
+    }
+
+    #[test]
     fn is_manifest_digest_url_requires_a_supported_digest() {
         let test_cases = vec![
             (
@@ -405,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_from_manifest_url_parses_oci_manifest_digests() {
+    fn extract_from_manifest_digest_url_parses_oci_manifest_digests() {
         let test_cases: Vec<(&str, fn(Option<Digest>))> = vec![
             (
                 "http://registry.example.com/v2/library/ubuntu/manifests/sha256:b2c366cce7e68013d5441c6326d5a3e1b12aeb5ed58564d0fd3fa089bc29cb6e",
@@ -451,7 +584,7 @@ mod tests {
         ];
 
         for (url, expect) in test_cases {
-            expect(Digest::extract_from_manifest_url(url));
+            expect(Digest::extract_from_manifest_digest_url(url));
         }
     }
 

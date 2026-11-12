@@ -23,7 +23,8 @@ use dragonfly_api::common::v2::{
 use dragonfly_api::dfdaemon::{
     self,
     v2::{
-        download_task_response, DownloadTaskResponse, ListLocalTasksResponse, StatLocalTaskResponse,
+        download_task_response, DeleteImageResponse, DownloadTaskResponse, ListLocalTasksResponse,
+        StatLocalTaskResponse,
     },
 };
 use dragonfly_api::errordetails::v2::{Backend, Unknown};
@@ -49,12 +50,13 @@ use dragonfly_client_metric::{
 use dragonfly_client_storage::{metadata, Storage};
 use dragonfly_client_util::{
     http::{hashmap_to_headermap, headermap_to_hashmap},
-    id_generator::IDGenerator,
+    id_generator::{IDGenerator, ImageIDParameter},
     shutdown,
 };
 use futures::future::select_all;
 use leaky_bucket::RateLimiter;
 use reqwest::header::HeaderMap;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -64,7 +66,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{
     mpsc::{self, Sender},
-    Mutex, Notify, Semaphore,
+    Mutex, Notify, OwnedSemaphorePermit, Semaphore,
 };
 use tokio::task::JoinSet;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -155,6 +157,17 @@ impl Task {
         id: &str,
         request: Download,
     ) -> ClientResult<metadata::Task> {
+        // Create the task by image before preparing the task, so deleting other images
+        // retains the task.
+        if let Some(image) = &request.image {
+            let image_id = self
+                .id_generator
+                .image_id(ImageIDParameter::ReferenceBased(image.reference.clone()))?;
+            self.storage
+                .create_task_by_image(&image_id, id, image)
+                .await?;
+        }
+
         let (task, reused) = self.storage.prepare_download_task(id)?;
         if reused {
             // Attempt to create a hard link from the task file to the output path.
@@ -348,14 +361,18 @@ impl Task {
     ///    downloads from the source directly.
     /// 3. The task is small enough that the scheduling overhead outweighs the
     ///    transfer: the requested range length or the content length is less than
-    ///    or equal to the min piece length, i.e. a single-piece task.
+    ///    or equal to 16MiB.
     fn should_bypass_scheduler(&self, request: &Download, content_length: u64) -> bool {
+        // The maximum content length or range length of the download that bypasses
+        // the scheduler and downloads from the source directly.
+        const MAX_BYPASS_LENGTH: u64 = 16 * 1024 * 1024;
+
         request.scheduling_policy() == SchedulingPolicy::Auto
             && !request.disable_back_to_source
             && (request
                 .range
-                .is_some_and(|range| range.length <= piece::MIN_PIECE_LENGTH)
-                || content_length <= piece::MIN_PIECE_LENGTH)
+                .is_some_and(|range| range.length <= MAX_BYPASS_LENGTH)
+                || content_length <= MAX_BYPASS_LENGTH)
     }
 
     /// Downloads a task.
@@ -1253,6 +1270,13 @@ impl Task {
         // Get the id of the task.
         let task_id = task.id.as_str();
 
+        // Collect the trusted piece digests distributed by the scheduler.
+        let trusted_digests = Arc::new(trusted_piece_digests(&parents));
+        debug!(
+            "scheduler distributed {} trusted piece digests",
+            trusted_digests.len()
+        );
+
         // Register the parents for syncing host info.
         self.parent_selector
             .register(&parents)
@@ -1326,6 +1350,8 @@ impl Task {
                 need_piece_content: bool,
                 protocol: String,
                 parent_selector: Arc<ParentSelector>,
+                trusted_digest: Option<String>,
+                permit: OwnedSemaphorePermit,
             ) -> ClientResult<metadata::Piece> {
                 let piece_id = piece_manager.id(task_id.as_str(), number);
                 let mut collected_parents = parents;
@@ -1348,6 +1374,7 @@ impl Task {
                             length,
                             parent.clone(),
                             is_prefetch,
+                            trusted_digest.as_deref(),
                         )
                         .await
                     {
@@ -1363,6 +1390,34 @@ impl Task {
                             collected_parents
                                 .retain(|collected_parent| collected_parent.id != parent.id);
                             if collected_parents.is_empty() {
+                                // Report the failed piece right away, so the scheduler learns it while
+                                // the other pieces are still downloading.
+                                in_stream_tx
+                                    .send_timeout(
+                                        AnnouncePeerRequest {
+                                            host_id: host_id.to_string(),
+                                            task_id: task_id.to_string(),
+                                            peer_id: peer_id.to_string(),
+                                            request: Some(
+                                                announce_peer_request::Request::DownloadPieceFailedRequest(
+                                                    DownloadPieceFailedRequest {
+                                                        piece_number: Some(number),
+                                                        parent_id: parent.id.clone(),
+                                                        temporary: true,
+                                                    },
+                                                ),
+                                            ),
+                                        },
+                                        REQUEST_TIMEOUT,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|err| {
+                                        error!(
+                                            "send DownloadPieceFailedRequest for piece {} failed: {:?}",
+                                            piece_id, err
+                                        )
+                                    });
+
                                 return Err(Error::DownloadFromParentFailed(
                                     DownloadFromParentFailed {
                                         piece_number: number,
@@ -1373,6 +1428,12 @@ impl Task {
                         }
                     }
                 };
+
+                // Release the permit once the piece is written, so a slow scheduler does not stall
+                // the other pieces. Keep it while the piece content is held in memory.
+                if !need_piece_content {
+                    drop(permit);
+                }
 
                 // Construct the piece.
                 let piece = Piece {
@@ -1510,10 +1571,10 @@ impl Task {
             let finished_pieces = finished_pieces.clone();
             let protocol = self.config.download.protocol.clone();
             let parent_selector = self.parent_selector.clone();
+            let trusted_digest = trusted_digests.get(&collect_piece.number).cloned();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             join_set.spawn(
                 async move {
-                    let _permit = permit;
                     download_from_parent(
                         task_id,
                         host_id,
@@ -1531,6 +1592,8 @@ impl Task {
                         need_piece_content,
                         protocol,
                         parent_selector,
+                        trusted_digest,
+                        permit,
                     )
                     .await
                 }
@@ -1547,39 +1610,9 @@ impl Task {
         {
             match message {
                 Ok(_) => {}
-                Err(Error::DownloadFromParentFailed(err)) => {
-                    let (piece_number, parent_id) = (err.piece_number, err.parent_id);
-
-                    // Send the download piece failed request.
-                    in_stream_tx
-                        .send_timeout(
-                            AnnouncePeerRequest {
-                                host_id: host_id.to_string(),
-                                task_id: task_id.to_string(),
-                                peer_id: peer_id.to_string(),
-                                request: Some(
-                                    announce_peer_request::Request::DownloadPieceFailedRequest(
-                                        DownloadPieceFailedRequest {
-                                            piece_number: Some(err.piece_number),
-                                            parent_id,
-                                            temporary: true,
-                                        },
-                                    ),
-                                ),
-                            },
-                            REQUEST_TIMEOUT,
-                        )
-                        .await
-                        .unwrap_or_else(|err| {
-                            error!(
-                                "send DownloadPieceFailedRequest for piece {} failed: {:?}",
-                                self.piece.id(task_id, piece_number),
-                                err
-                            )
-                        });
-
-                    // If the download failed from the parent, continue to download the next
-                    // piece and ignore the error.
+                Err(Error::DownloadFromParentFailed(_)) => {
+                    // The failed piece is reported to the scheduler when it fails, continue to
+                    // download the next piece.
                     continue;
                 }
                 Err(Error::SendTimeout) => {
@@ -1634,6 +1667,9 @@ impl Task {
         let semaphore = Arc::new(Semaphore::new(
             self.config.download.back_to_source_concurrent_piece_count as usize,
         ));
+
+        // Initialize the interrupt. If a piece fails, stop dispatching the remaining pieces.
+        let interrupt = Arc::new(AtomicBool::new(false));
         for interested_piece in interested_pieces {
             async fn download_from_source(
                 task_id: String,
@@ -1654,6 +1690,7 @@ impl Task {
                 hugging_face: Option<HuggingFace>,
                 model_scope: Option<ModelScope>,
                 open_csg: Option<OpenCsg>,
+                permit: OwnedSemaphorePermit,
             ) -> ClientResult<metadata::Piece> {
                 let piece_id = piece_manager.id(task_id.as_str(), number);
                 debug!("start to download piece {} from source", piece_id);
@@ -1675,6 +1712,12 @@ impl Task {
                         open_csg,
                     )
                     .await?;
+
+                // Release the permit once the piece is written, so a slow scheduler does not stall
+                // the other pieces. Keep it while the piece content is held in memory.
+                if !need_piece_content {
+                    drop(permit);
+                }
 
                 // Construct the piece.
                 let piece = Piece {
@@ -1800,9 +1843,14 @@ impl Task {
             let model_scope = request.model_scope.clone();
             let open_csg = request.open_csg.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            if interrupt.load(Ordering::SeqCst) {
+                debug!("interrupt dispatching the pieces");
+                break;
+            }
+
+            let interrupt = interrupt.clone();
             join_set.spawn(
                 async move {
-                    let _permit = permit;
                     download_from_source(
                         task_id,
                         host_id,
@@ -1822,8 +1870,10 @@ impl Task {
                         hugging_face,
                         model_scope,
                         open_csg,
+                        permit,
                     )
                     .await
+                    .inspect_err(|_| interrupt.store(true, Ordering::SeqCst))
                 }
                 .in_current_span(),
             );
@@ -2207,6 +2257,9 @@ impl Task {
         let semaphore = Arc::new(Semaphore::new(
             self.config.download.back_to_source_concurrent_piece_count as usize,
         ));
+
+        // Initialize the interrupt. If a piece fails, stop dispatching the remaining pieces.
+        let interrupt = Arc::new(AtomicBool::new(false));
         for interested_piece in interested_pieces.clone() {
             async fn download_from_source(
                 task_id: String,
@@ -2350,6 +2403,12 @@ impl Task {
             let model_scope = request.model_scope.clone();
             let open_csg = request.open_csg.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            if interrupt.load(Ordering::SeqCst) {
+                debug!("interrupt dispatching the pieces");
+                break;
+            }
+
+            let interrupt = interrupt.clone();
             join_set.spawn(
                 async move {
                     let _permit = permit;
@@ -2373,6 +2432,7 @@ impl Task {
                         open_csg,
                     )
                     .await
+                    .inspect_err(|_| interrupt.store(true, Ordering::SeqCst))
                 }
                 .in_current_span(),
             );
@@ -2508,6 +2568,53 @@ impl Task {
         }
     }
 
+    /// Deletes the tasks of the image which are not referenced by other images, and
+    /// deletes the peers of the deleted tasks from the scheduler in the background. All
+    /// the platforms of the image are deleted if the platform is none.
+    #[instrument(skip_all)]
+    pub async fn delete_image(
+        &self,
+        image_id: &str,
+        platform: Option<&str>,
+        host_id: &str,
+    ) -> ClientResult<DeleteImageResponse> {
+        let (deleted_task_ids, retained_task_ids) =
+            self.storage.delete_image(image_id, platform).await?;
+
+        // Spawn to delete the peers from the scheduler, so the unavailable scheduler does
+        // not block the deletion, and the failure does not fail the deletion like the
+        // garbage collector.
+        let scheduler_client = self.scheduler_client.clone();
+        let host_id = host_id.to_string();
+        let task_ids = deleted_task_ids.clone();
+        tokio::spawn(
+            async move {
+                for task_id in task_ids {
+                    scheduler_client
+                        .delete_task(DeleteTaskRequest {
+                            host_id: host_id.clone(),
+                            task_id: task_id.clone(),
+                        })
+                        .await
+                        .unwrap_or_else(|err| {
+                            error!("delete task {} from scheduler failed: {}", task_id, err);
+                        });
+                }
+            }
+            .in_current_span(),
+        );
+
+        info!(
+            "delete image {} {:?}, deleted tasks: {:?}, retained tasks: {:?}",
+            image_id, platform, deleted_task_ids, retained_task_ids
+        );
+
+        Ok(DeleteImageResponse {
+            deleted_task_ids,
+            retained_task_ids,
+        })
+    }
+
     /// Delete a local task and reclaim local storage.
     #[instrument(skip_all)]
     pub async fn delete_local(&self, task_id: &str) -> ClientResult<()> {
@@ -2529,10 +2636,123 @@ impl Task {
     }
 }
 
+/// Returns the trusted piece digests distributed by the scheduler in the task
+/// of the candidate parents, keyed by the piece number. The scheduler records
+/// them from the peers downloading the pieces from the source, so they do not
+/// depend on the parent serving the pieces. Malformed digests are skipped, and
+/// a piece the parents disagree on is left out, its pieces are verified
+/// against the digest announced by the parent as before.
+fn trusted_piece_digests(parents: &[Peer]) -> HashMap<u32, String> {
+    let mut digests: HashMap<u32, Option<String>> = HashMap::new();
+    for piece in parents
+        .iter()
+        .filter_map(|parent| parent.task.as_ref())
+        .flat_map(|task| task.pieces.iter())
+    {
+        if piece
+            .digest
+            .parse::<dragonfly_client_util::digest::Digest>()
+            .is_err()
+        {
+            continue;
+        }
+
+        digests
+            .entry(piece.number)
+            .and_modify(|digest| {
+                if digest.as_deref() != Some(piece.digest.as_str()) {
+                    *digest = None;
+                }
+            })
+            .or_insert_with(|| Some(piece.digest.clone()));
+    }
+
+    digests
+        .into_iter()
+        .filter_map(|(number, digest)| digest.map(|digest| (number, digest)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::type_complexity)]
+
     use super::*;
     use tempfile::tempdir;
+
+    const SHA256_DIGEST_A: &str =
+        "sha256:0f2592159700536c81cd58094265e92089ebabb3e06f802c5f2d6e8e753cb233";
+    const SHA256_DIGEST_B: &str =
+        "sha256:a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e";
+
+    /// Returns a candidate parent whose task carries the pieces with the
+    /// numbers and digests.
+    fn parent_with_pieces(pieces: &[(u32, &str)]) -> Peer {
+        Peer {
+            task: Some(CommonTask {
+                pieces: pieces
+                    .iter()
+                    .map(|(number, digest)| Piece {
+                        number: *number,
+                        digest: digest.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_piece_digests_collects_the_digests_of_the_parents() {
+        let test_cases: Vec<(Vec<Peer>, Vec<(u32, &str)>)> = vec![
+            (vec![], vec![]),
+            // A parent without task.
+            (vec![Peer::default()], vec![]),
+            (
+                vec![parent_with_pieces(&[
+                    (0, SHA256_DIGEST_A),
+                    (1, SHA256_DIGEST_B),
+                ])],
+                vec![(0, SHA256_DIGEST_A), (1, SHA256_DIGEST_B)],
+            ),
+            // The pieces are merged across the parents.
+            (
+                vec![
+                    parent_with_pieces(&[(0, SHA256_DIGEST_A)]),
+                    parent_with_pieces(&[(0, SHA256_DIGEST_A), (2, SHA256_DIGEST_B)]),
+                ],
+                vec![(0, SHA256_DIGEST_A), (2, SHA256_DIGEST_B)],
+            ),
+            // A piece the parents disagree on is left out.
+            (
+                vec![
+                    parent_with_pieces(&[(0, SHA256_DIGEST_A), (1, SHA256_DIGEST_A)]),
+                    parent_with_pieces(&[(0, SHA256_DIGEST_B)]),
+                    parent_with_pieces(&[(0, SHA256_DIGEST_A)]),
+                ],
+                vec![(1, SHA256_DIGEST_A)],
+            ),
+            // Empty and malformed digests are skipped.
+            (
+                vec![parent_with_pieces(&[
+                    (0, ""),
+                    (1, "sha256:short"),
+                    (2, "md5:1"),
+                ])],
+                vec![],
+            ),
+        ];
+
+        for (parents, expected) in test_cases {
+            let expected: HashMap<u32, String> = expected
+                .into_iter()
+                .map(|(number, digest)| (number, digest.to_string()))
+                .collect();
+            assert_eq!(trusted_piece_digests(&parents), expected);
+        }
+    }
 
     #[tokio::test]
     async fn delete_task_removes_the_task_from_storage() {

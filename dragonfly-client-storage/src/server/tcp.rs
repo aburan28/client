@@ -802,7 +802,9 @@ async fn sendfile_range(
         match stream.try_io(tokio::io::Interest::WRITABLE, || {
             let mut off = offset;
             let count = remaining.min(MAX_SENDFILE_COUNT) as usize;
-            rustix::fs::sendfile(stream, fd, Some(&mut off), count)
+
+            // Hand off the worker, since sendfile waits on disk for the pages not in the page cache.
+            tokio::task::block_in_place(|| rustix::fs::sendfile(stream, fd, Some(&mut off), count))
                 .map(|n| n as u64)
                 .map_err(std::io::Error::from)
         }) {
@@ -835,7 +837,8 @@ mod tests {
     const DATA_LENGTH: u64 = 8 * 1024 * 1024;
     const TASK_ID: &str = "d3add1f66b0d0b8083f14479d6e181ec9e2b34cf07d4a1a2ee2fcf51d3a3f14a";
     const CONTENT: &[u8] = b"piece content";
-    const CONTENT_DIGEST: &str = "crc32:2533597436";
+    const CONTENT_DIGEST: &str =
+        "sha256:0f2592159700536c81cd58094265e92089ebabb3e06f802c5f2d6e8e753cb233";
 
     async fn handler(dir: &Path) -> TCPServerHandler {
         let config = Arc::new(Config::default());
@@ -861,7 +864,7 @@ mod tests {
         (sender, receiver)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sendfile_range_sends_the_range_until_eof() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("task");
@@ -896,7 +899,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sendfile_range_fails_when_the_peer_closed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("task");
@@ -911,7 +914,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn handle_serves_the_requests_on_the_connection_until_the_client_closes_it() {
         let temp_dir = tempfile::tempdir().unwrap();
         let handler = handler(temp_dir.path()).await;
@@ -934,6 +937,7 @@ mod tests {
                 TASK_ID,
                 0,
                 CONTENT.len() as u64,
+                false,
                 &mut stream,
                 Duration::from_secs(5),
             )
@@ -965,7 +969,7 @@ mod tests {
         assert!(server.await.unwrap().is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_fails_on_a_short_send() {
         let temp_dir = tempfile::tempdir().unwrap();
         let handler = handler(temp_dir.path()).await;

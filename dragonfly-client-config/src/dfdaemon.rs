@@ -93,6 +93,17 @@ fn default_host_hostname() -> String {
     hostname::get().unwrap().to_string_lossy().to_string()
 }
 
+/// Deserializes the hostname, treating `null` and the empty string like a missing field so
+/// that they fall back to the default, as `serde(default)` alone only covers missing fields.
+fn deserialize_host_hostname<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(default_host_hostname))
+}
+
 /// Returns the default plugin directory for dfdaemon.
 #[inline]
 fn default_dfdaemon_plugin_dir() -> PathBuf {
@@ -183,6 +194,13 @@ fn default_back_to_source_concurrent_piece_count() -> u32 {
     8
 }
 
+/// Returns whether to verify the downloaded OCI blobs against the digest in
+/// their URL by default.
+#[inline]
+fn default_download_verify_blob_digest() -> bool {
+    true
+}
+
 /// Returns the default max retries for backend request, default is 1.
 #[inline]
 fn default_backend_max_retries() -> u32 {
@@ -233,6 +251,17 @@ fn default_download_max_schedule_count() -> u32 {
 #[inline]
 fn default_tracing_path() -> Option<PathBuf> {
     Some(PathBuf::from("/v1/traces"))
+}
+
+/// Deserializes the tracing path, treating `null` like a missing field so that it falls back
+/// to the default instead of clearing it.
+fn deserialize_tracing_path<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<PathBuf>::deserialize(deserializer)?.or_else(default_tracing_path))
 }
 
 /// Returns the default interval to announce peer to the scheduler.
@@ -340,6 +369,22 @@ fn default_gc_policy_disk_threshold() -> ByteSize {
     ByteSize::default()
 }
 
+/// Deserializes the disk threshold, treating `null` like a missing field so that it falls
+/// back to the default, which `bytesize_serde` alone rejects.
+fn deserialize_gc_policy_disk_threshold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<ByteSize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(with = "bytesize_serde")] ByteSize);
+
+    Ok(Option::<Wrapper>::deserialize(deserializer)?
+        .map(|Wrapper(disk_threshold)| disk_threshold)
+        .unwrap_or_else(default_gc_policy_disk_threshold))
+}
+
 /// Returns the default high threshold percent of the disk usage.
 #[inline]
 fn default_gc_policy_disk_high_threshold_percent() -> u8 {
@@ -402,7 +447,10 @@ pub struct Host {
     pub location: Option<String>,
 
     /// The hostname of the host.
-    #[serde(default = "default_host_hostname")]
+    #[serde(
+        default = "default_host_hostname",
+        deserialize_with = "deserialize_host_hostname"
+    )]
     pub hostname: String,
 
     /// The advertise ip of the host.
@@ -545,6 +593,15 @@ pub struct Download {
     #[serde(default = "default_back_to_source_concurrent_piece_count")]
     #[validate(range(min = 1))]
     pub back_to_source_concurrent_piece_count: u32,
+
+    /// Indicates whether to verify an OCI blob downloaded to an output path
+    /// against the digest in its URL when the request carries no digest.
+    /// The piece digests are announced by the parent serving the pieces, so
+    /// they detect corruption but not a malicious parent, the digest of the
+    /// blob is the trust anchor of its content. On a mismatch the task is
+    /// deleted from the local storage so it is not served to other peers.
+    #[serde(default = "default_download_verify_blob_digest")]
+    pub verify_blob_digest: bool,
 }
 
 /// Implement Default for Download.
@@ -559,6 +616,7 @@ impl Default for Download {
             collected_piece_timeout: default_collected_download_piece_timeout(),
             concurrent_piece_count: default_download_concurrent_piece_count(),
             back_to_source_concurrent_piece_count: default_back_to_source_concurrent_piece_count(),
+            verify_blob_digest: default_download_verify_blob_digest(),
         }
     }
 }
@@ -1025,6 +1083,28 @@ pub enum WritebackMode {
     Off,
 }
 
+/// PieceDigestAlgorithm is the algorithm of the digests calculated for the
+/// pieces written to the storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PieceDigestAlgorithm {
+    /// Crc32 calculates CRC32 piece digests. It detects accidental corruption
+    /// only, and the pieces downloaded from parents are verified with the
+    /// algorithm of the expected digest, so a node keeps interoperating with
+    /// parents that calculate SHA-256 piece digests. Use it during a rolling
+    /// upgrade from a version calculating CRC32 piece digests.
+    Crc32,
+
+    /// Sha256 calculates SHA-256 piece digests, and the pieces downloaded from
+    /// parents must be verified against a SHA-256 digest, a CRC32 expected
+    /// digest is rejected instead of downgrading the verification. Nodes of a
+    /// version calculating CRC32 piece digests can not verify the pieces of
+    /// the nodes calculating SHA-256 piece digests and the other way around,
+    /// so they download those pieces from other parents or the source.
+    #[default]
+    Sha256,
+}
+
 /// The storage configuration for dfdaemon.
 #[derive(Debug, Clone, Validate, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -1035,6 +1115,11 @@ pub struct Storage {
     /// The writeback mode for written piece ranges, default is async.
     #[serde(default)]
     pub writeback_mode: WritebackMode,
+
+    /// The algorithm of the digests calculated for the written pieces, default
+    /// is sha256.
+    #[serde(default)]
+    pub piece_digest_algorithm: PieceDigestAlgorithm,
 
     /// The directory to store task's metadata and content.
     #[serde(default = "crate::default_storage_dir")]
@@ -1056,7 +1141,7 @@ pub struct Storage {
     /// Larger buffers improve write throughput by batching disk I/O operations and reducing
     /// system call overhead, but consume more memory. Smaller buffers reduce memory usage
     /// but may degrade write performance due to frequent I/O operations.
-    /// Default is 4MiB. Adjust based on your disk type (SSD vs HDD) and available memory.
+    /// Default is 2MiB. Adjust based on your disk type (SSD vs HDD) and available memory.
     #[serde(default = "default_storage_write_buffer_size")]
     pub write_buffer_size: usize,
 
@@ -1064,7 +1149,7 @@ pub struct Storage {
     /// Larger buffers improve read throughput by reducing I/O system calls and better
     /// utilizing disk sequential read performance, but increase memory consumption.
     /// Smaller buffers reduce memory footprint but may cause more frequent I/O operations.
-    /// Default is 1MiB. Tune based on your access patterns and memory constraints.
+    /// Default is 2MiB. Tune based on your access patterns and memory constraints.
     #[serde(default = "default_storage_read_buffer_size")]
     pub read_buffer_size: usize,
 
@@ -1108,6 +1193,7 @@ impl Default for Storage {
         Storage {
             server: StorageServer::default(),
             writeback_mode: WritebackMode::default(),
+            piece_digest_algorithm: PieceDigestAlgorithm::default(),
             dir: crate::default_storage_dir(),
             keep: default_storage_keep(),
             write_piece_timeout: default_storage_write_piece_timeout(),
@@ -1171,7 +1257,8 @@ pub struct Policy {
     /// This allows dfdaemon to effectively manage a logical portion of the disk for its cache,
     /// rather than always considering the entire disk volume.
     #[serde(
-        with = "bytesize_serde",
+        serialize_with = "bytesize_serde::serialize",
+        deserialize_with = "deserialize_gc_policy_disk_threshold",
         default = "default_gc_policy_disk_threshold",
         alias = "distThreshold"
     )]
@@ -1340,16 +1427,15 @@ impl ProxyServer {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SchedulingPolicy {
-    /// Auto downloads through the scheduler unless the content length is smaller
-    /// than the minimum piece length, in which case it downloads from the source
-    /// directly, skipping the scheduler.
+    /// Auto downloads through the scheduler unless the content length or the range
+    /// length is less than or equal to 16MiB, in which case it downloads from the
+    /// source directly, skipping the scheduler.
     #[default]
     Auto,
 
-    /// Always downloads through the scheduler even if the content length is smaller
-    /// than the minimum piece length, so that the peer announces the task to the
-    /// scheduler and other peers can discover it as a parent. It is useful for
-    /// sharing small artifacts, such as OCI image manifests.
+    /// Always downloads through the scheduler even for small files, so that the peer
+    /// announces the task to the scheduler and other peers can discover it as a
+    /// parent. It is useful for sharing small artifacts, such as OCI image manifests.
     Always,
 }
 
@@ -1493,7 +1579,7 @@ pub struct Proxy {
     /// Specifies the buffer size for reading piece data from disk.
     /// Larger buffers can improve throughput for sequential reads but consume more memory.
     /// Smaller buffers reduce memory usage but may increase I/O overhead.
-    /// Default value is 1MiB. Adjust based on your disk I/O characteristics and memory constraints.
+    /// Default value is 2MiB. Adjust based on your disk I/O characteristics and memory constraints.
     #[serde(default = "default_proxy_read_buffer_size")]
     pub read_buffer_size: usize,
 }
@@ -1634,7 +1720,10 @@ pub struct Tracing {
 
     /// The path to report tracing log, example: "/v1/traces" if the protocol is "http" or
     /// "https".
-    #[serde(default = "default_tracing_path")]
+    #[serde(
+        default = "default_tracing_path",
+        deserialize_with = "deserialize_tracing_path"
+    )]
     pub path: Option<PathBuf>,
 
     /// The headers to report tracing log.
@@ -1950,6 +2039,21 @@ mod tests {
     }
 
     #[test]
+    fn host_hostname_falls_back_to_default_when_null_or_empty() {
+        let test_cases = vec![
+            (r#"{}"#, default_host_hostname()),
+            (r#"{"hostname": null}"#, default_host_hostname()),
+            (r#"{"hostname": ""}"#, default_host_hostname()),
+            (r#"{"hostname": "host1"}"#, "host1".to_string()),
+        ];
+
+        for (json, expected) in test_cases {
+            let host: Host = serde_json::from_str(json).unwrap();
+            assert_eq!(host.hostname, expected);
+        }
+    }
+
+    #[test]
     fn server_deserializes_fields_and_defaults() {
         let test_cases: Vec<(&str, fn(&Server))> = vec![
             (
@@ -1997,7 +2101,8 @@ mod tests {
                     "pieceTimeout": "30s",
                     "collectedPieceTimeout": "40s",
                     "concurrentPieceCount": 10,
-                    "backToSourceConcurrentPieceCount": 4
+                    "backToSourceConcurrentPieceCount": 4,
+                    "verifyBlobDigest": false
                 }"#,
                 |download| {
                     assert_eq!(
@@ -2013,6 +2118,7 @@ mod tests {
                     assert_eq!(download.collected_piece_timeout, Duration::from_secs(40));
                     assert_eq!(download.concurrent_piece_count, 10);
                     assert_eq!(download.back_to_source_concurrent_piece_count, 4);
+                    assert!(!download.verify_blob_digest);
                 },
             ),
             ("{}", |download| {
@@ -2029,6 +2135,7 @@ mod tests {
                 assert_eq!(download.collected_piece_timeout, Duration::from_secs(360));
                 assert_eq!(download.concurrent_piece_count, 8);
                 assert_eq!(download.back_to_source_concurrent_piece_count, 8);
+                assert!(download.verify_blob_digest);
             }),
         ];
 
@@ -2402,6 +2509,25 @@ mod tests {
     }
 
     #[test]
+    fn piece_digest_algorithm_deserializes_from_lowercase_name() {
+        let test_cases = vec![
+            ("\"crc32\"", PieceDigestAlgorithm::Crc32),
+            ("\"sha256\"", PieceDigestAlgorithm::Sha256),
+        ];
+
+        for (json, expected) in test_cases {
+            let algorithm: PieceDigestAlgorithm = serde_json::from_str(json).unwrap();
+            assert_eq!(algorithm, expected);
+        }
+
+        assert!(serde_json::from_str::<PieceDigestAlgorithm>("\"md5\"").is_err());
+        assert_eq!(
+            PieceDigestAlgorithm::default(),
+            PieceDigestAlgorithm::Sha256
+        );
+    }
+
+    #[test]
     fn storage_deserializes_fields_and_defaults() {
         let test_cases: Vec<(&str, fn(&Storage))> = vec![
             (
@@ -2413,6 +2539,7 @@ mod tests {
                         "quicPort": 4006
                     },
                     "writebackMode": "sync",
+                    "pieceDigestAlgorithm": "crc32",
                     "dir": "/tmp/storage",
                     "keep": true,
                     "writePieceTimeout": "20s",
@@ -2426,6 +2553,7 @@ mod tests {
                     assert!(storage.server.tcp_fastopen);
                     assert_eq!(storage.server.quic_port, 4006);
                     assert_eq!(storage.writeback_mode, WritebackMode::Sync);
+                    assert_eq!(storage.piece_digest_algorithm, PieceDigestAlgorithm::Crc32);
                     assert_eq!(storage.dir, PathBuf::from("/tmp/storage"));
                     assert!(storage.keep);
                     assert_eq!(storage.write_piece_timeout, Duration::from_secs(20));
@@ -2440,6 +2568,7 @@ mod tests {
                 assert!(!storage.server.tcp_fastopen);
                 assert_eq!(storage.server.quic_port, 4006);
                 assert_eq!(storage.writeback_mode, WritebackMode::Async);
+                assert_eq!(storage.piece_digest_algorithm, PieceDigestAlgorithm::Sha256);
                 assert_eq!(storage.dir, crate::default_storage_dir());
                 assert!(!storage.keep);
                 assert_eq!(storage.write_piece_timeout, Duration::from_secs(360));
@@ -2599,6 +2728,9 @@ mod tests {
                     assert_eq!(gc.policy.disk_low_threshold_percent, 70);
                 },
             ),
+            (r#"{"policy": {"diskThreshold": null}}"#, |gc| {
+                assert_eq!(gc.policy.disk_threshold, ByteSize::default());
+            }),
             ("{}", |gc| {
                 assert_eq!(gc.interval, Duration::from_secs(900));
                 assert_eq!(gc.policy.task_ttl, Duration::from_secs(2_592_000));
@@ -2794,6 +2926,9 @@ mod tests {
                     assert!(tracing.headers.contains_key("X-Custom-Header"));
                 },
             ),
+            (r#"{"path": null}"#, |tracing| {
+                assert_eq!(tracing.path, Some(PathBuf::from("/v1/traces")));
+            }),
             ("{}", |tracing| {
                 assert!(tracing.protocol.is_none());
                 assert!(tracing.endpoint.is_none());
