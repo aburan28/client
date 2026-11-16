@@ -62,6 +62,10 @@ pub enum DFError {
     #[error{"piece {0} not found"}]
     PieceNotFound(String),
 
+    /// The error when the image is not found.
+    #[error{"image {0} not found"}]
+    ImageNotFound(String),
+
     /// The error when the piece state is failed.
     #[error{"piece {0} state is failed"}]
     PieceStateIsFailed(String),
@@ -157,6 +161,11 @@ pub enum DFError {
     /// The error when the error is unknown.
     #[error("unknown {0}")]
     Unknown(String),
+
+    /// The error for the encryption at rest of the storage, e.g. the key
+    /// encryption key is unavailable or the content fails to authenticate.
+    #[error("encryption: {0}")]
+    Encryption(String),
 
     /// The error when the feature is not implemented.
     #[error{"unimplemented"}]
